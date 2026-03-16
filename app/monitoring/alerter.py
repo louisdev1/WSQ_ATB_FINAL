@@ -13,7 +13,7 @@ from typing import Optional
 
 import aiohttp
 
-from app.config import config
+from app.temp_files.config import config
 
 log = logging.getLogger(__name__)
 

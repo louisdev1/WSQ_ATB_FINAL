@@ -1,38 +1,43 @@
 """
 config.py – Load .env and expose a single Config object.
 
-PATH in .env is the project root. All other paths are derived from it.
-Works on Windows and Raspberry Pi without any code changes.
+The project root is always derived from this file's location on disk —
+no PATH or PROJECT_PATH variable is needed or read for path resolution.
+This avoids collisions with the system PATH environment variable on all
+platforms (Windows, Linux, Raspberry Pi).
+
+Path variables in .env (BOT_LOG_FILE, DB_PATH, SESSION_DIR) still support
+the ${PROJECT_PATH} placeholder for explicit overrides, but the defaults
+work correctly with no configuration at all.
 """
 
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Project root is always the parent of the directory containing this file.
+# config.py lives at  <project_root>/app/config.py
+# so project_root    = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
-def _resolve_env_path(raw: str, project_root: Path) -> Path:
-    """Replace ${PATH} placeholder and return an absolute Path."""
-    resolved = raw.replace("${PATH}", str(project_root))
+
+def _resolve_env_path(raw: str) -> Path:
+    """Replace ${PROJECT_PATH} placeholder and return an absolute Path."""
+    resolved = raw.replace("${PROJECT_PATH}", str(_PROJECT_ROOT))
+    resolved = resolved.replace("${PATH}", str(_PROJECT_ROOT))   # legacy compat
     p = Path(resolved)
     if not p.is_absolute():
-        p = project_root / p
+        p = _PROJECT_ROOT / p
     return p
 
 
 def _load() -> "Config":
-    # Find .env relative to this file's parent's parent (project root)
-    here = Path(__file__).resolve().parent.parent
-    env_file = here / ".env"
+    env_file = _PROJECT_ROOT / ".env"
     load_dotenv(dotenv_path=env_file, override=True)
-
-    raw_path = os.getenv("PATH", str(here))
-    # On Unix $PATH is the system PATH; detect if it looks like a system path
-    # and fall back to the directory containing this file.
-    project_root = Path(raw_path) if Path(raw_path).exists() else here
 
     def _p(key: str, default: str) -> Path:
         raw = os.getenv(key, default)
-        return _resolve_env_path(raw, project_root)
+        return _resolve_env_path(raw)
 
     def _bool(key: str, default: bool) -> bool:
         return os.getenv(key, str(default)).lower() in ("1", "true", "yes")
@@ -44,7 +49,7 @@ def _load() -> "Config":
         return float(os.getenv(key, str(default)))
 
     return Config(
-        project_root=project_root,
+        project_root=_PROJECT_ROOT,
         # Telegram
         telegram_api_id=_int("TELEGRAM_API_ID", 0),
         telegram_api_hash=os.getenv("TELEGRAM_API_HASH", ""),
@@ -60,7 +65,7 @@ def _load() -> "Config":
         max_leverage=_int("MAX_LEVERAGE", 10),
         risk_per_trade=_float("RISK_PER_TRADE", 0.15),
         dry_run=_bool("DRY_RUN", False),
-        # Signal filter (data-driven, 258K+ combos tested)
+        # Signal filter
         filter_enabled=_bool("FILTER_ENABLED", True),
         filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 3.0),
         filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 1.0),
@@ -71,10 +76,10 @@ def _load() -> "Config":
         # Alert bot
         alert_bot_token=os.getenv("ALERT_BOT_TOKEN", ""),
         alert_chat_id=os.getenv("ALERT_CHAT_ID", ""),
-        # Paths
-        log_file=_p("BOT_LOG_FILE", "${PATH}/logs/bot.log"),
-        db_path=_p("DB_PATH", "${PATH}/data/bot.db"),
-        session_dir=_p("SESSION_DIR", "${PATH}/sessions"),
+        # Paths — defaults are relative to project root, no config needed
+        log_file=_p("BOT_LOG_FILE", "${PROJECT_PATH}/logs/bot.log"),
+        db_path=_p("DB_PATH", "${PROJECT_PATH}/data/bot.db"),
+        session_dir=_p("SESSION_DIR", "${PROJECT_PATH}/sessions"),
         # Alert thresholds
         alert_telegram_seconds=_int("ALERT_TELEGRAM_SECONDS", 120),
         alert_bybit_seconds=_int("ALERT_BYBIT_SECONDS", 180),

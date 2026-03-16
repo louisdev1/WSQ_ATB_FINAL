@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from pybit.unified_trading import WebSocket
 
-from app.monitoring.watchdog import report_bybit_ok, report_bybit_fail
+from app.monitoring.temp_files.watchdog import report_bybit_ok, report_bybit_fail
 
 log = logging.getLogger(__name__)
 

@@ -2,11 +2,16 @@
 database.py – Async SQLite storage layer using aiosqlite.
 
 All state is persisted here. The bot can restart without losing context.
+
+Schema additions (auto-migrated on connect):
+  trades.realised_pnl   – USDT profit/loss recorded when a trade closes
+  trades.closed_at      – UTC timestamp when the trade reached a terminal state
 """
 
 import json
 import logging
 import aiosqlite
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -32,14 +37,15 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_low               REAL,
     entry_high              REAL,
     stop_loss               REAL,
-    targets_json            TEXT,       -- JSON list of target prices
+    targets_json            TEXT,
     filled_size             REAL DEFAULT 0,
     avg_entry_price         REAL DEFAULT 0,
     state                   TEXT DEFAULT 'pending',
-    -- State values: pending | active | break_even | closed | cancelled | sl_hit
     break_even_activated    INTEGER DEFAULT 0,
     entries_cancelled       INTEGER DEFAULT 0,
-    highest_tp_hit          INTEGER DEFAULT 0,  -- ratchet: which TP level last filled (0 = none)
+    highest_tp_hit          INTEGER DEFAULT 0,
+    realised_pnl            REAL DEFAULT NULL,
+    closed_at               TEXT DEFAULT NULL,
     created_at              TEXT DEFAULT (datetime('now')),
     updated_at              TEXT DEFAULT (datetime('now'))
 );
@@ -49,7 +55,7 @@ CREATE TABLE IF NOT EXISTS orders (
     trade_id        INTEGER REFERENCES trades(id),
     bybit_order_id  TEXT UNIQUE,
     symbol          TEXT,
-    order_type      TEXT,   -- entry | tp | sl | close
+    order_type      TEXT,
     side            TEXT,
     price           REAL,
     qty             REAL,
@@ -72,6 +78,13 @@ CREATE TABLE IF NOT EXISTS bot_state (
 );
 """
 
+# All columns that might not exist in older DBs — migrated safely on connect
+_MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN highest_tp_hit INTEGER DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN realised_pnl REAL DEFAULT NULL",
+    "ALTER TABLE trades ADD COLUMN closed_at TEXT DEFAULT NULL",
+]
+
 
 class Database:
     def __init__(self, path: Path):
@@ -83,15 +96,12 @@ class Database:
         self._db = await aiosqlite.connect(str(self._path))
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_CREATE_TABLES)
-        # Migration: add highest_tp_hit column to existing databases
-        try:
-            await self._db.execute(
-                "ALTER TABLE trades ADD COLUMN highest_tp_hit INTEGER DEFAULT 0"
-            )
-            await self._db.commit()
-            log.info("DB migration: added highest_tp_hit column")
-        except Exception:
-            pass  # Column already exists – fine
+        for migration in _MIGRATIONS:
+            try:
+                await self._db.execute(migration)
+                await self._db.commit()
+            except Exception:
+                pass  # Column already exists — fine
         await self._db.commit()
         log.info("Database connected: %s", self._path)
 
@@ -102,14 +112,12 @@ class Database:
     # ── raw messages ──────────────────────────────────────────────────────────
 
     async def save_raw_message(self, telegram_id: int, raw_text: str, message_type: str) -> bool:
-        """Returns False if duplicate (already processed)."""
         try:
             await self._db.execute(
                 "INSERT OR IGNORE INTO raw_messages (telegram_id, raw_text, message_type) VALUES (?,?,?)",
                 (telegram_id, raw_text, message_type),
             )
             await self._db.commit()
-            # Check if it was a duplicate
             async with self._db.execute(
                 "SELECT id FROM raw_messages WHERE telegram_id=?", (telegram_id,)
             ) as cur:
@@ -185,6 +193,17 @@ class Database:
     async def update_trade_state(self, trade_id: int, state: str):
         await self.update_trade(trade_id, state=state)
 
+    async def close_trade(self, trade_id: int, state: str, realised_pnl: Optional[float] = None):
+        """
+        Mark a trade as closed/sl_hit and record PnL + timestamp.
+        Always use this instead of update_trade_state for terminal states.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        kwargs: Dict[str, Any] = {"state": state, "closed_at": now}
+        if realised_pnl is not None:
+            kwargs["realised_pnl"] = realised_pnl
+        await self.update_trade(trade_id, **kwargs)
+
     # ── orders ────────────────────────────────────────────────────────────────
 
     async def save_order(self, trade_id: int, bybit_order_id: str, symbol: str,
@@ -228,6 +247,41 @@ class Database:
             return d
         return None
 
+    # ── stats queries ─────────────────────────────────────────────────────────
+
+    async def get_closed_trades_since(self, since_iso: str) -> List[Dict]:
+        """Return all terminal trades closed after since_iso (ISO datetime string)."""
+        async with self._db.execute(
+            """SELECT * FROM trades
+               WHERE state IN ('closed','sl_hit')
+               AND closed_at IS NOT NULL
+               AND closed_at >= ?
+               ORDER BY closed_at DESC""",
+            (since_iso,),
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["targets"] = json.loads(d.get("targets_json") or "[]")
+            result.append(d)
+        return result
+
+    async def get_all_closed_trades(self) -> List[Dict]:
+        """Return every terminal trade, oldest first."""
+        async with self._db.execute(
+            """SELECT * FROM trades
+               WHERE state IN ('closed','sl_hit')
+               ORDER BY closed_at ASC NULLS LAST, updated_at ASC"""
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["targets"] = json.loads(d.get("targets_json") or "[]")
+            result.append(d)
+        return result
+
     # ── alerts ────────────────────────────────────────────────────────────────
 
     async def save_alert(self, alert_type: str, message: str):
@@ -245,10 +299,9 @@ class Database:
             row = await cur.fetchone()
         return row["sent_at"] if row else None
 
-    # ── bot state (filter tracking) ───────────────────────────────────────────
+    # ── bot state ─────────────────────────────────────────────────────────────
 
     async def _get_state(self, key: str) -> Optional[str]:
-        """Read a value from the bot_state key-value store."""
         try:
             async with self._db.execute(
                 "SELECT value FROM bot_state WHERE key=?", (key,)
@@ -259,7 +312,6 @@ class Database:
             return None
 
     async def _set_state(self, key: str, value: str):
-        """Write a value to the bot_state key-value store."""
         await self._db.execute(
             "INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, datetime('now')) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
@@ -268,15 +320,12 @@ class Database:
         await self._db.commit()
 
     async def get_last_trade_result(self) -> Optional[str]:
-        """Returns 'WIN' or 'LOSS' or None. Used by skip-after-loss filter."""
         return await self._get_state("last_trade_result")
 
     async def set_last_trade_result(self, result: str):
-        """Store 'WIN' or 'LOSS'. Called when a trade closes."""
         await self._set_state("last_trade_result", result)
 
     async def get_last_signal_time(self):
-        """Returns datetime or None. Used by rapid-signal filter."""
         from datetime import datetime
         val = await self._get_state("last_signal_time")
         if val:
@@ -287,5 +336,4 @@ class Database:
         return None
 
     async def set_last_signal_time(self, dt):
-        """Store a datetime as ISO string. Called on every signal (even skipped)."""
         await self._set_state("last_signal_time", dt.isoformat())

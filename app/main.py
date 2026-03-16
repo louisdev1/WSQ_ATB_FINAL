@@ -24,6 +24,7 @@ from app.parsing.parser import parse_message
 from app.parsing.models import MessageType
 from app.domain.trade_manager import TradeManager
 from app.intake.telegram_listener import TelegramListener
+from app.intake.admin_listener import admin_loop
 from app.monitoring.watchdog import watchdog_loop, report_bybit_ok, report_bybit_fail
 from app.monitoring.alerter import send_alert
 
@@ -45,6 +46,32 @@ def _col(text: str, colour: str) -> str:
     return f"{colour}{text}{_RST}"
 
 
+def _check_position_mode(bybit: BybitClient) -> None:
+    """
+    Warn loudly if the Bybit account is in Hedge Mode.
+    The bot assumes One-Way Mode (positionIdx=0).  Hedge Mode will cause all
+    order placements and SL moves to fail with cryptic errors.
+    """
+    try:
+        resp = bybit._session.get_position_mode(category="linear")
+        mode = resp.get("result", {}).get("mode", None)
+        # Bybit: mode=0 → One-Way, mode=3 → Hedge
+        if mode == 3:
+            log.warning(
+                "⚠️  BYBIT ACCOUNT IS IN HEDGE MODE (mode=3).  "
+                "This bot requires One-Way Mode (mode=0).  "
+                "All order placements will fail.  "
+                "Switch to One-Way Mode in Bybit → Preferences → Position Mode."
+            )
+        elif mode == 0:
+            log.info("Bybit position mode: One-Way ✓")
+        else:
+            log.info("Bybit position mode: %s (unknown value — check manually)", mode)
+    except Exception as exc:
+        # Not a fatal error — some sub-accounts may not support this endpoint
+        log.debug("Could not check position mode: %s", exc)
+
+
 async def _print_startup_summary(db: Database, bybit: BybitClient):
     """
     Print a human-readable dashboard to stdout right after startup sync.
@@ -52,7 +79,6 @@ async def _print_startup_summary(db: Database, bybit: BybitClient):
     Stale trades were already closed by startup_position_sync before this runs.
     """
     W = 62
-    # get_active_trades only returns non-closed/cancelled/sl_hit states
     trades = await db.get_active_trades()
 
     lines = []
@@ -86,13 +112,12 @@ async def _print_startup_summary(db: Database, bybit: BybitClient):
             targets   = t.get("targets", [])
             tp_hit    = t.get("highest_tp_hit", 0) or 0
 
-            # Source of truth: Bybit live position
             pos        = bybit.fetch_position(sym)
-            live_size  = float(pos.get("size", 0))       if pos else 0.0
-            mark_price = float(pos.get("markPrice", 0))  if pos else 0.0
+            live_size  = float(pos.get("size", 0))          if pos else 0.0
+            mark_price = float(pos.get("markPrice", 0))     if pos else 0.0
             upnl       = float(pos.get("unrealisedPnl", 0)) if pos else 0.0
-            live_sl    = float(pos.get("stopLoss") or 0) if pos else 0.0
-            live_entry = float(pos.get("avgPrice", 0))   if pos else avg_entry
+            live_sl    = float(pos.get("stopLoss") or 0)    if pos else 0.0
+            live_entry = float(pos.get("avgPrice", 0))      if pos else avg_entry
 
             dir_col = _G if direction == "LONG" else _R
             seeded  = bool(t.get("entries_cancelled")) and live_entry > 0 and not targets
@@ -114,17 +139,17 @@ async def _print_startup_summary(db: Database, bybit: BybitClient):
                 else:
                     lines.append(f"    {'Stop-loss':<20} {_col('NOT SET  \u26a0', _R)}")
             else:
-                # Should rarely appear here (startup_position_sync closes these),
-                # but guard just in case race condition on very fresh entry orders.
                 lines.append(f"    {_col('No live position yet (entry orders pending?)', _Y)}")
                 if sl:
                     lines.append(f"    {'Stop-loss (DB)':<20} {_col(f'{sl:.6f}', _R)}")
 
-            # Open entry orders from Bybit REST (source of truth)
-            open_orders = bybit.fetch_open_orders(sym)
-            entry_orders = [o for o in open_orders if o.get("orderType") == "Limit"
-                            and o.get("side") in ("Buy", "Sell")
-                            and str(o.get("reduceOnly", "false")).lower() != "true"]
+            open_orders  = bybit.fetch_open_orders(sym)
+            entry_orders = [
+                o for o in open_orders
+                if o.get("orderType") == "Limit"
+                and o.get("side") in ("Buy", "Sell")
+                and str(o.get("reduceOnly", "false")).lower() != "true"
+            ]
             if entry_orders:
                 lines.append(f"    {'Open entries':<20} {len(entry_orders)} limit order(s)")
                 for o in entry_orders:
@@ -177,15 +202,26 @@ async def _on_telegram_message(db: Database, trade_manager: TradeManager,
 
 
 async def _telegram_loop(db: Database, trade_manager: TradeManager):
-    """Keeps the Telegram listener alive with auto-reconnect."""
-    while True:
-        async def message_handler(raw_text: str, msg_id: int):
-            await _on_telegram_message(db, trade_manager, raw_text, msg_id)
+    """
+    Keeps the Telegram listener alive with auto-reconnect.
 
-        listener = TelegramListener(on_message=message_handler)
+    A single TelegramListener (and its underlying TelegramClient) is created
+    once and reused across reconnect attempts — avoids session-file locking
+    and abandoned socket handles that occurred when a new client was created
+    on every loop iteration.
+    """
+    async def message_handler(raw_text: str, msg_id: int):
+        await _on_telegram_message(db, trade_manager, raw_text, msg_id)
+
+    listener = TelegramListener(on_message=message_handler)
+
+    while True:
         try:
             await listener.start()
-            log.warning("Telegram listener stopped. Reconnecting in %ss…", _TELEGRAM_RECONNECT_DELAY)
+            log.warning(
+                "Telegram listener stopped. Reconnecting in %ss…",
+                _TELEGRAM_RECONNECT_DELAY,
+            )
         except Exception as exc:
             log.error("Telegram listener crashed: %s", exc)
         await asyncio.sleep(_TELEGRAM_RECONNECT_DELAY)
@@ -212,6 +248,10 @@ async def main():
     bybit._dry_run = config.dry_run
     bybit.set_health_callbacks(on_ok=report_bybit_ok, on_fail=report_bybit_fail)
 
+    # ── position mode check (warn if Hedge Mode) ──────────────────────────────
+    if not config.dry_run:
+        _check_position_mode(bybit)
+
     # ── domain ────────────────────────────────────────────────────────────────
     trade_manager = TradeManager(db=db, bybit=bybit)
 
@@ -236,6 +276,7 @@ async def main():
             _telegram_loop(db, trade_manager),
             ws.start(),
             watchdog_loop(db, bybit, trade_manager),
+            admin_loop(trade_manager, bybit),
         )
     except KeyboardInterrupt:
         log.info("Shutting down…")

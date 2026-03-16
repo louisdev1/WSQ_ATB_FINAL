@@ -64,47 +64,45 @@ class BybitClient:
             self._fail(f"set_leverage {symbol}", exc)
             return False
 
-    def get_qty_step(self, symbol: str) -> float:
+    def _fetch_instrument_info(self, symbol: str) -> dict:
         """
-        Fetch the minimum qty step for a symbol from Bybit instrument info.
-        E.g. NEOUSDT = 1.0, BTCUSDT = 0.001, AXLUSDT = 0.1
-        Result is cached in memory for the lifetime of this client instance.
+        Fetch and cache instrument info for a symbol (single API call).
+        Returns a dict with keys: qty_step, tick_size, min_qty.
+        Cached for the lifetime of this client instance.
         """
-        if not hasattr(self, "_qty_step_cache"):
-            self._qty_step_cache = {}
-        if symbol in self._qty_step_cache:
-            return self._qty_step_cache[symbol]
+        if not hasattr(self, "_instrument_cache"):
+            self._instrument_cache = {}
+        if symbol in self._instrument_cache:
+            return self._instrument_cache[symbol]
         try:
             resp = self._session.get_instruments_info(category="linear", symbol=symbol)
             info = resp.get("result", {}).get("list", [{}])[0]
-            step = float(info.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
-            self._qty_step_cache[symbol] = step
-            log.debug("qty_step for %s = %s", symbol, step)
-            return step
+            result = {
+                "qty_step": float(info.get("lotSizeFilter", {}).get("qtyStep", "0.001")),
+                "tick_size": float(info.get("priceFilter", {}).get("tickSize", "0.0001")),
+                "min_qty": float(info.get("lotSizeFilter", {}).get("minOrderQty", "0")),
+            }
+            self._instrument_cache[symbol] = result
+            log.debug(
+                "instrument_info %s: qty_step=%s tick_size=%s min_qty=%s",
+                symbol, result["qty_step"], result["tick_size"], result["min_qty"],
+            )
+            return result
         except Exception as exc:
-            log.warning("get_qty_step error %s: %s — defaulting to 0.001", symbol, exc)
-            return 0.001
+            log.warning("_fetch_instrument_info %s: %s — using defaults", symbol, exc)
+            return {"qty_step": 0.001, "tick_size": 0.0001, "min_qty": 0.0}
+
+    def get_qty_step(self, symbol: str) -> float:
+        """Minimum qty increment for a symbol. Cached via _fetch_instrument_info."""
+        return self._fetch_instrument_info(symbol)["qty_step"]
 
     def get_tick_size(self, symbol: str) -> float:
-        """
-        Fetch the minimum price tick size for a symbol from Bybit instrument info.
-        E.g. BTCUSDT = 0.1, AXLUSDT = 0.0001, NEOUSDT = 0.001
-        Result is cached alongside qty_step.
-        """
-        if not hasattr(self, "_tick_size_cache"):
-            self._tick_size_cache = {}
-        if symbol in self._tick_size_cache:
-            return self._tick_size_cache[symbol]
-        try:
-            resp = self._session.get_instruments_info(category="linear", symbol=symbol)
-            info = resp.get("result", {}).get("list", [{}])[0]
-            tick = float(info.get("priceFilter", {}).get("tickSize", "0.0001"))
-            self._tick_size_cache[symbol] = tick
-            log.debug("tick_size for %s = %s", symbol, tick)
-            return tick
-        except Exception as exc:
-            log.warning("get_tick_size error %s: %s — defaulting to 0.0001", symbol, exc)
-            return 0.0001
+        """Minimum price tick for a symbol. Cached via _fetch_instrument_info."""
+        return self._fetch_instrument_info(symbol)["tick_size"]
+
+    def get_min_qty(self, symbol: str) -> float:
+        """Minimum order quantity for a symbol. Cached via _fetch_instrument_info."""
+        return self._fetch_instrument_info(symbol)["min_qty"]
 
     def _round_qty(self, symbol: str, qty: float) -> float:
         """Floor qty to the symbol's allowed step size."""
@@ -141,8 +139,12 @@ class BybitClient:
             return fake_id
         try:
             qty = self._round_qty(symbol, qty)
-            if qty <= 0:
-                log.warning("place_limit_order %s: qty rounds to 0 after step adjustment", symbol)
+            min_qty = self.get_min_qty(symbol)
+            if qty <= 0 or (min_qty > 0 and qty < min_qty):
+                log.warning(
+                    "place_limit_order %s: qty=%.6f below min_qty=%.6f — skipping",
+                    symbol, qty, min_qty,
+                )
                 return None
             kwargs = dict(
                 category="linear",
@@ -176,8 +178,12 @@ class BybitClient:
             return fake_id
         try:
             qty = self._round_qty(symbol, qty)
-            if qty <= 0:
-                log.warning("place_market_order %s: qty rounds to 0 after step adjustment", symbol)
+            min_qty = self.get_min_qty(symbol)
+            if qty <= 0 or (min_qty > 0 and qty < min_qty):
+                log.warning(
+                    "place_market_order %s: qty=%.6f below min_qty=%.6f — skipping",
+                    symbol, qty, min_qty,
+                )
                 return None
             resp = self._session.place_order(
                 category="linear",

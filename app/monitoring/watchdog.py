@@ -8,16 +8,23 @@ Tracks:
 - Log tail scanning for tracebacks
 
 Sends recovery ("all clear") messages when issues resolve.
+
+Thread-safety note: report_*_ok / report_*_fail are called from pybit's
+internal WebSocket thread.  They now schedule state updates onto the asyncio
+event loop via _loop_ref rather than writing to globals from a foreign thread.
+The watchdog loop reads the flags only from the event loop, so there is no
+data race.
 """
 
 import asyncio
 import logging
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import config
+from app.temp_files.config import config
 from app.monitoring.alerter import send_alert, send_recovery, format_duration
 
 log = logging.getLogger(__name__)
@@ -34,7 +41,7 @@ class IssueTracker:
             log.debug("Issue first seen: %s", key)
 
     def clear(self, key: str) -> float:
-        """Clear an issue and return how long it lasted (0.0 if it wasn't tracked)."""
+        """Clear an issue and return how long it lasted (0.0 if not tracked)."""
         if key in self._issues:
             duration = (datetime.now(timezone.utc) - self._issues[key]).total_seconds()
             del self._issues[key]
@@ -53,37 +60,71 @@ class IssueTracker:
 
 _tracker = IssueTracker()
 
-# ── connectivity flags (set by intake/exchange layers) ────────────────────────
+# ── connectivity flags ────────────────────────────────────────────────────────
+# Read ONLY from the asyncio event loop (watchdog_loop).
+# Written via _schedule_flag_update() which is safe to call from any thread.
 
 _telegram_ok: bool = True
 _bybit_ok: bool = True
-# Track previous state so we can detect transitions for recovery messages
 _telegram_was_down: bool = False
 _bybit_was_down: bool = False
 
+# Reference to the running event loop — set once by watchdog_loop at startup.
+_loop_ref: Optional[asyncio.AbstractEventLoop] = None
+_loop_lock = threading.Lock()
+
+
+def _schedule_flag_update(fn):
+    """
+    Thread-safe helper.  If called from the event-loop thread, run fn directly.
+    If called from any other thread (e.g. pybit WS thread), schedule it onto
+    the event loop so globals are always written from the loop thread.
+    """
+    with _loop_lock:
+        loop = _loop_ref
+    if loop is None:
+        # Loop not started yet — run directly (startup path, single-threaded)
+        fn()
+        return
+    try:
+        if loop.is_running():
+            loop.call_soon_threadsafe(fn)
+        else:
+            fn()
+    except RuntimeError:
+        fn()
+
 
 def report_telegram_ok():
-    global _telegram_ok
-    _telegram_ok = True
-    _tracker.clear("telegram_down")
+    def _do():
+        global _telegram_ok
+        _telegram_ok = True
+        _tracker.clear("telegram_down")
+    _schedule_flag_update(_do)
 
 
 def report_telegram_fail():
-    global _telegram_ok
-    _telegram_ok = False
-    _tracker.mark("telegram_down")
+    def _do():
+        global _telegram_ok
+        _telegram_ok = False
+        _tracker.mark("telegram_down")
+    _schedule_flag_update(_do)
 
 
 def report_bybit_ok():
-    global _bybit_ok
-    _bybit_ok = True
-    _tracker.clear("bybit_down")
+    def _do():
+        global _bybit_ok
+        _bybit_ok = True
+        _tracker.clear("bybit_down")
+    _schedule_flag_update(_do)
 
 
 def report_bybit_fail():
-    global _bybit_ok
-    _bybit_ok = False
-    _tracker.mark("bybit_down")
+    def _do():
+        global _bybit_ok
+        _bybit_ok = False
+        _tracker.mark("bybit_down")
+    _schedule_flag_update(_do)
 
 
 # ── log tail watcher ──────────────────────────────────────────────────────────
@@ -126,11 +167,11 @@ async def _check_unprotected_positions(db, bybit) -> None:
                 _tracker.mark(f"no_sl_{sym}")
                 age = _tracker.age_seconds(f"no_sl_{sym}")
                 if age > config.alert_sl_seconds:
-                    size = float(pos.get("size", 0))
-                    avg_price = float(pos.get("avgPrice", 0))
+                    size       = float(pos.get("size", 0))
+                    avg_price  = float(pos.get("avgPrice", 0))
                     mark_price = float(pos.get("markPrice", 0))
-                    upnl = float(pos.get("unrealisedPnl", 0))
-                    side = pos.get("side", "?")
+                    upnl       = float(pos.get("unrealisedPnl", 0))
+                    side       = pos.get("side", "?")
                     await send_alert(
                         f"no_sl_{sym}",
                         f"⚠️ Position *{sym}* has NO stop-loss for {format_duration(age)}!\n"
@@ -157,7 +198,11 @@ async def _check_unprotected_positions(db, bybit) -> None:
 
 async def watchdog_loop(db, bybit, trade_manager):
     """Runs forever in the background. Check interval: 30s."""
-    global _telegram_was_down, _bybit_was_down
+    global _telegram_was_down, _bybit_was_down, _loop_ref
+
+    # Capture the running loop so report_* helpers can schedule onto it
+    with _loop_lock:
+        _loop_ref = asyncio.get_running_loop()
 
     log.info("Watchdog started")
     while True:
@@ -204,7 +249,7 @@ async def watchdog_loop(db, bybit, trade_manager):
             # Unprotected positions
             await _check_unprotected_positions(db, bybit)
 
-            # Sync fills
+            # Sync fills (REST fallback + missed TP detection)
             if trade_manager:
                 await trade_manager.sync_fills()
 

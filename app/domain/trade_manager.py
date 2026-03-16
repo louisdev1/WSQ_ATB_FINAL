@@ -17,7 +17,7 @@ Entry ladder (dynamic by range %):
     Entry_low  → smallest fraction (best price, least likely)
 
 TP orders:    placed on first fill, qty split equally across remaining targets
-SL:           placed immediately on signal arrival
+SL:           attached directly to each entry order (activates on fill)
 TP ratchet:   TP1 fills → cancel entries, move SL to avg_entry
               TP2 fills → move SL to TP1 price
               TP3 fills → move SL to TP2 price  (etc.)
@@ -49,18 +49,36 @@ log = logging.getLogger(__name__)
 def _calc_ladder(entry_low: float, entry_high: float) -> List[Tuple]:
     """
     Returns a list of (price, fraction) tuples for entry orders.
-    Fixed distribution: entry_high 65% / midpoint 25% / entry_low 10%.
-    Collapses to single order at full qty for single-price signals.
+
+    Range-based distribution (% of total qty):
+      < 0.7%       →  80 / 15 / 5
+      0.7% – 1.5%  →  70 / 20 / 10
+      1.5% – 3%    →  65 / 25 / 10
+      > 3%         →  50 / 30 / 20
+
+    Entry_high gets the largest fraction (fills soonest).
+    Collapses to a single order at full qty for single-price signals.
     """
     if entry_low <= 0 or entry_high <= entry_low:
         price = entry_high if entry_high > 0 else entry_low
         return [(price, 1.0)]
 
     midpoint = (entry_low + entry_high) / 2
+    range_pct = (entry_high - entry_low) / midpoint * 100
+
+    if range_pct < 0.7:
+        fracs = (0.80, 0.15, 0.05)
+    elif range_pct < 1.5:
+        fracs = (0.70, 0.20, 0.10)
+    elif range_pct < 3.0:
+        fracs = (0.65, 0.25, 0.10)
+    else:
+        fracs = (0.50, 0.30, 0.20)
+
     return [
-        (entry_high, 0.65),
-        (midpoint,   0.25),
-        (entry_low,  0.10),
+        (entry_high, fracs[0]),
+        (midpoint,   fracs[1]),
+        (entry_low,  fracs[2]),
     ]
 
 
@@ -157,54 +175,291 @@ class TradeManager:
         except Exception as exc:
             log.error("Notification send failed: %s", exc)
 
+    # ── startup position sync ─────────────────────────────────────────────────
+
     async def startup_position_sync(self):
         """
-        Called once at boot. Reconciles DB with Bybit:
-        - Active DB trades with no live position → mark closed
-        - Live positions → update filled_size from Bybit
+        Called once at boot. Reconciles DB ↔ Bybit in three passes:
+
+        Pass 1 – known DB trades
+          • Active DB trade + live position  → update filled_size/avg_entry, re-sync
+            TP orders and SL so management continues seamlessly after restart.
+          • Active DB trade + no live position → position closed while bot was
+            offline; mark closed (WIN if any TP was hit, else LOSS).
+
+        Pass 2 – live positions with no DB record (bot started a trade, crashed
+          before writing to DB, OR position was opened on Bybit manually but a
+          DB record already exists from a previous bot run that got corrupted).
+          These are skipped with a warning — we cannot safely reconstruct targets.
+
+        Pass 3 – live Bybit positions with no matching DB trade at all
+          → logged as "untracked position" so the user knows about them, but
+          the bot does NOT attempt to manage them (no targets/SL in DB).
         """
-        trades = await self._db.get_active_trades()
-        synced_closed = []
-        synced_live   = []
-        for trade in trades:
+        db_trades   = await self._db.get_active_trades()
+        all_live    = self._bybit.fetch_all_positions()   # size > 0
+        live_by_sym = {p["symbol"]: p for p in all_live}
+
+        synced_closed   = []
+        synced_live     = []
+        synced_restored = []
+
+        # ── Pass 1: reconcile known DB trades ─────────────────────────────────
+        for trade in db_trades:
             symbol = trade["symbol"]
-            pos = self._bybit.fetch_position(symbol)
+            pos    = live_by_sym.get(symbol)
             live_size = float(pos.get("size", 0)) if pos else 0.0
 
             if live_size <= 0:
+                # Position gone → closed while offline
                 highest_tp = trade.get("highest_tp_hit", 0) or 0
                 result = "WIN" if highest_tp > 0 else "LOSS"
                 await self._db.set_last_trade_result(result)
-                await self._db.update_trade_state(trade["id"], "closed")
+                await self._db.close_trade(trade["id"], "closed")
                 synced_closed.append(f"{symbol} → {result} (TP{highest_tp})")
                 log.info(
                     "Startup sync: %s no live position (TP%d) → closed (%s)",
                     symbol, highest_tp, result,
                 )
             else:
-                avg_price = float(pos.get("avgPrice", 0)) if pos else 0.0
-                upnl = float(pos.get("unrealisedPnl", 0)) if pos else 0.0
-                await self._db.update_trade(
-                    trade["id"], filled_size=live_size, avg_entry_price=avg_price,
-                )
-                synced_live.append(f"{symbol} size={live_size:.4f} PnL={upnl:+.2f}")
-                log.info("Startup sync: %s live size=%.4f", symbol, live_size)
+                # Position still open → update DB and resume management
+                avg_price = float(pos.get("avgPrice", 0))
+                upnl      = float(pos.get("unrealisedPnl", 0))
+                live_sl   = float(pos.get("stopLoss") or 0)
 
-        # Send a single startup summary notification
+                await self._db.update_trade(
+                    trade["id"],
+                    filled_size=live_size,
+                    avg_entry_price=avg_price,
+                )
+
+                # ── Re-sync SL ─────────────────────────────────────────────
+                # Use the live Bybit SL as source-of-truth if it is set
+                # (ratchet may have moved it while bot was offline).
+                # If Bybit has no SL, re-apply the DB value to protect position.
+                db_sl = trade.get("stop_loss", 0) or 0.0
+                if live_sl > 0 and abs(live_sl - db_sl) > 0.000001:
+                    # Bybit SL differs from DB — update DB to match live
+                    log.info(
+                        "Startup sync: %s SL mismatch — Bybit=%.5f DB=%.5f → updating DB",
+                        symbol, live_sl, db_sl,
+                    )
+                    await self._db.update_trade(trade["id"], stop_loss=live_sl)
+                elif live_sl == 0 and db_sl > 0:
+                    # No SL on Bybit but we have one in DB → re-apply it
+                    log.info(
+                        "Startup sync: %s no SL on Bybit, re-applying DB SL %.5f",
+                        symbol, db_sl,
+                    )
+                    self._bybit.move_stop_loss(symbol, db_sl)
+
+                # ── Re-sync TP orders ──────────────────────────────────────
+                # Detect how many TPs have filled by comparing live open
+                # reduce-only orders on Bybit vs what we expect.
+                # This keeps the ratchet correct after a restart mid-trade.
+                targets     = trade.get("targets", [])
+                highest_tp  = trade.get("highest_tp_hit", 0) or 0
+                if targets and live_size > 0:
+                    highest_tp = await self._detect_highest_tp_hit(
+                        trade, live_size, highest_tp
+                    )
+                    if highest_tp != (trade.get("highest_tp_hit", 0) or 0):
+                        log.info(
+                            "Startup sync: %s highest_tp_hit updated %d → %d",
+                            symbol,
+                            trade.get("highest_tp_hit", 0) or 0,
+                            highest_tp,
+                        )
+                        await self._db.update_trade(
+                            trade["id"], highest_tp_hit=highest_tp
+                        )
+                    # Refresh DB open-order records and re-place missing TP orders
+                    await self._resync_tp_orders_on_bybit(trade, live_size, highest_tp)
+
+                synced_live.append(
+                    f"{symbol} size={live_size:.4f} "
+                    f"entry={avg_price:.4f} "
+                    f"SL={live_sl or db_sl:.4f} "
+                    f"PnL={upnl:+.2f}"
+                )
+                synced_restored.append(symbol)
+                log.info(
+                    "Startup sync: %s RESUMED — size=%.4f avg=%.4f TP_hit=%d",
+                    symbol, live_size, avg_price, highest_tp,
+                )
+
+        # ── Pass 2: live positions that have no DB trade ───────────────────────
+        known_symbols = {t["symbol"] for t in db_trades}
+        for sym, pos in live_by_sym.items():
+            if sym not in known_symbols:
+                size  = float(pos.get("size", 0))
+                side  = pos.get("side", "?")
+                entry = float(pos.get("avgPrice", 0))
+                upnl  = float(pos.get("unrealisedPnl", 0))
+                log.warning(
+                    "Startup sync: UNTRACKED position %s %s size=%.4f entry=%.4f "
+                    "— not managed by bot (no DB record)",
+                    sym, side, size, entry,
+                )
+                synced_live.append(
+                    f"{sym} ⚠ UNTRACKED {side} size={size:.4f} "
+                    f"entry={entry:.4f} PnL={upnl:+.2f}"
+                )
+
+        # ── Startup summary notification ───────────────────────────────────────
         balance = self._bybit.fetch_wallet_balance()
         mode = "DRY RUN" if config.dry_run else "LIVE"
         lines = [f"🟢 *Bot started* ({mode})", f"Balance: `{balance:.2f} USDT`"]
-        if synced_live:
-            lines.append(f"\n📊 *Active positions ({len(synced_live)}):*")
-            for s in synced_live:
+        if synced_restored:
+            lines.append(f"\n▶️ *Resumed management ({len(synced_restored)}):*")
+            for s in synced_live[:len(synced_restored)]:
                 lines.append(f"  • {s}")
         if synced_closed:
-            lines.append(f"\n🗑 *Closed during sync ({len(synced_closed)}):*")
+            lines.append(f"\n🗑 *Closed during offline ({len(synced_closed)}):*")
             for s in synced_closed:
                 lines.append(f"  • {s}")
-        if not synced_live and not synced_closed:
+        untracked = [s for s in synced_live[len(synced_restored):]]
+        if untracked:
+            lines.append(f"\n⚠️ *Untracked positions (manual):*")
+            for s in untracked:
+                lines.append(f"  • {s}")
+        if not synced_restored and not synced_closed and not untracked:
             lines.append("No active trades.")
         await self._notify("\n".join(lines))
+
+    async def _detect_highest_tp_hit(
+        self, trade: dict, live_size: float, current_highest: int
+    ) -> int:
+        """
+        Estimate how many TPs have filled by comparing the live position size
+        to the original total qty.  We can't know for certain without order
+        history, but we can use the remaining qty fraction to infer a lower bound.
+
+        Also cross-checks against open reduce-only orders on Bybit: if a TP
+        order is missing from the open orders we know at minimum that level fired.
+        """
+        targets    = trade.get("targets", [])
+        total_tps  = len(targets)
+        if not total_tps:
+            return current_highest
+
+        fractions = _tp_fractions(total_tps)
+
+        # Qty remaining if N TPs have been hit = original_qty × sum(remaining fractions)
+        # We infer original_qty from DB filled_size (set on first fill)
+        original_qty = trade.get("filled_size", 0) or live_size
+        if original_qty <= 0:
+            return current_highest
+
+        # Walk from current_highest upward and see if the observed size is
+        # consistent with more TPs having fired.
+        best_estimate = current_highest
+        remaining_after = [
+            original_qty * sum(fractions[n:])
+            for n in range(total_tps + 1)
+        ]
+
+        for n in range(current_highest, total_tps):
+            expected_remaining = remaining_after[n + 1]
+            # If live size ≤ expected remaining after TP(n+1), it's possible
+            # TP(n+1) has filled.  Use a 5% tolerance for partial fills / rounding.
+            if live_size <= expected_remaining * 1.05:
+                best_estimate = n + 1
+            else:
+                break  # sizes are monotonically decreasing; stop when it no longer fits
+
+        return max(current_highest, best_estimate)
+
+    async def _resync_tp_orders_on_bybit(
+        self, trade: dict, live_size: float, highest_tp_hit: int
+    ):
+        """
+        After a restart, cancel stale DB TP records and re-place any missing
+        TP orders on Bybit so the ratchet continues working.
+
+        Strategy:
+          1. Fetch open reduce-only limit orders from Bybit for this symbol.
+          2. Mark any DB tp orders that are no longer open on Bybit as cancelled.
+          3. Place any missing TP levels (from highest_tp_hit+1 onward) that
+             don't already have a live order.
+        """
+        symbol    = trade["symbol"]
+        trade_id  = trade["id"]
+        targets   = trade.get("targets", [])
+        direction = trade["direction"]
+        if not targets or live_size <= 0:
+            return
+
+        # Fetch live reduce-only orders from Bybit
+        live_orders = self._bybit.fetch_open_orders(symbol)
+        live_reduce_only = {
+            float(o.get("price", 0)): o
+            for o in live_orders
+            if str(o.get("reduceOnly", "false")).lower() == "true"
+        }
+
+        # Mark stale DB tp records as cancelled
+        db_open = await self._db.get_open_orders_for_trade(trade_id)
+        for order in db_open:
+            if not order["order_type"].startswith("tp"):
+                continue
+            price = float(order.get("price", 0))
+            if price not in live_reduce_only:
+                await self._db.mark_order_status(order["bybit_order_id"], "cancelled")
+                log.debug(
+                    "Startup sync: marked stale TP order %s as cancelled",
+                    order["bybit_order_id"],
+                )
+
+        # Determine which TP levels still need live orders
+        close_side        = _opposite_side(direction)
+        remaining_targets = targets[highest_tp_hit:]
+        if not remaining_targets:
+            return
+
+        fractions = _tp_fractions(len(targets))
+        remaining_fractions = fractions[highest_tp_hit:]
+        frac_sum = sum(remaining_fractions)
+        if frac_sum <= 0:
+            return
+        remaining_fractions = [f / frac_sum for f in remaining_fractions]
+
+        # For each remaining TP, place it only if there is no live order
+        # at that price (within a small tolerance)
+        for i, (tp_price, frac) in enumerate(zip(remaining_targets, remaining_fractions)):
+            tp_num = highest_tp_hit + i + 1
+
+            # Check if a live order already covers this TP price
+            already_live = any(
+                abs(p - tp_price) < tp_price * 0.0005
+                for p in live_reduce_only
+            )
+            if already_live:
+                # Ensure the DB record exists for tracking
+                log.debug(
+                    "Startup sync: TP%d for %s already live on Bybit at %.5f — skipping placement",
+                    tp_num, symbol, tp_price,
+                )
+                continue
+
+            order_qty = _floor3(live_size * frac)
+            if tp_price <= 0 or order_qty <= 0:
+                continue
+
+            order_id = self._bybit.place_take_profit_order(
+                symbol, close_side, order_qty, tp_price
+            )
+            if order_id:
+                await self._db.save_order(
+                    trade_id, order_id, symbol, f"tp{tp_num}",
+                    close_side, tp_price, order_qty
+                )
+                log.info(
+                    "Startup sync: re-placed TP%d for %s at %.5f qty=%.4f",
+                    tp_num, symbol, tp_price, order_qty,
+                )
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def handle(self, msg: ParsedMessage):
         t = msg.message_type
@@ -309,20 +564,26 @@ class TradeManager:
         side   = _entry_side(sig.direction.value)
         ladder = _calc_ladder(sig.entry_low, sig.entry_high)
 
+        # FIX #1: attach SL directly to each entry order so it becomes active
+        # the instant any leg fills — no separate move_stop_loss on empty position.
         for price, fraction in ladder:
             price     = round(price, 8)
             order_qty = _floor3(qty * fraction)
             if order_qty <= 0 or price <= 0:
                 continue
             order_id = self._bybit.place_limit_order(
-                sig.symbol, side, order_qty, price, order_type_label="entry"
+                sig.symbol, side, order_qty, price,
+                order_type_label="entry",
+                stop_loss=sig.stop_loss,          # ← attached to order
             )
             if order_id:
                 await self._db.save_order(
                     trade_id, order_id, sig.symbol, "entry", side, price, order_qty
                 )
 
-        self._bybit.move_stop_loss(sig.symbol, sig.stop_loss)
+        # NOTE: move_stop_loss deliberately removed here.
+        # Bybit rejects set_trading_stop when no position exists yet (ErrCode 10001).
+        # The SL above is attached per-order and fires on first fill.
 
         await self._db.update_trade_state(trade_id, "active")
         log.info(
@@ -360,6 +621,10 @@ class TradeManager:
         """
         Cancel open TP orders and replace with fresh ones based on actual
         filled position size. Skips TP levels already hit.
+
+        FIX #5: always re-fetch live position size from Bybit rather than
+        relying on the caller-supplied filled_qty, to avoid over-placing after
+        partial closes or mid-session size changes.
         """
         trade_id       = trade["id"]
         symbol         = trade["symbol"]
@@ -367,7 +632,13 @@ class TradeManager:
         targets        = trade.get("targets", [])
         highest_tp_hit = trade.get("highest_tp_hit", 0) or 0
 
-        if not targets or filled_qty <= 0:
+        if not targets:
+            return
+
+        # FIX #5: authoritative size from Bybit REST
+        pos = self._bybit.fetch_position(symbol)
+        live_qty = float(pos.get("size", 0)) if pos else filled_qty
+        if live_qty <= 0:
             return
 
         open_orders = await self._db.get_open_orders_for_trade(trade_id)
@@ -385,17 +656,15 @@ class TradeManager:
 
         # Weighted TP distribution based on total number of targets in signal
         fractions = _tp_fractions(len(targets))
-        # Slice to the remaining (not-yet-hit) levels
         remaining_fractions = fractions[highest_tp_hit:]
-        # Renormalise so remaining fractions sum to 1.0
         frac_sum = sum(remaining_fractions)
         if frac_sum <= 0:
             return
         remaining_fractions = [f / frac_sum for f in remaining_fractions]
 
         for i, (tp_price, frac) in enumerate(zip(remaining_targets, remaining_fractions)):
-            tp_num   = highest_tp_hit + i + 1
-            order_qty = _floor3(filled_qty * frac)
+            tp_num    = highest_tp_hit + i + 1
+            order_qty = _floor3(live_qty * frac)
             if tp_price <= 0 or order_qty <= 0:
                 continue
             order_id = self._bybit.place_take_profit_order(
@@ -408,8 +677,8 @@ class TradeManager:
                 )
 
         log.info(
-            "TP orders refreshed for %s | filled=%.4f | remaining=%d | dist=%s",
-            symbol, filled_qty, len(remaining_targets),
+            "TP orders refreshed for %s | live=%.4f | remaining=%d | dist=%s",
+            symbol, live_qty, len(remaining_targets),
             "/".join(f"{f*100:.0f}%" for f in remaining_fractions),
         )
 
@@ -533,8 +802,10 @@ class TradeManager:
                 pos       = self._bybit.fetch_position(symbol)
                 remaining = float(pos.get("size", 0)) if pos else 0.0
                 if remaining <= 0:
+                    # Fetch closed PnL from the execution that just filled
+                    closed_pnl = float(pos.get("unrealisedPnl", 0)) if pos else None
                     await self._db.set_last_trade_result("WIN")
-                    await self._db.update_trade_state(trade["id"], "closed")
+                    await self._db.close_trade(trade["id"], "closed", realised_pnl=closed_pnl)
                     log.info("All TPs filled for %s – trade closed (WIN)", symbol)
                     await self._notify(
                         f"🏆 *All targets hit — trade closed!*\n"
@@ -543,7 +814,6 @@ class TradeManager:
                         f"Result: *WIN*"
                     )
                 else:
-                    # Notify about the individual TP hit
                     fresh_trade = await self._db.get_trade_by_symbol(symbol)
                     upnl = float(pos.get("unrealisedPnl", 0)) if pos else 0.0
                     new_sl = fresh_trade.get("stop_loss", 0) if fresh_trade else 0
@@ -560,44 +830,70 @@ class TradeManager:
     # ── WebSocket order status handler ────────────────────────────────────────
 
     async def on_ws_order(self, msg: dict):
-        """Detects SL hit via order status change."""
+        """Detects SL hit via order status change.
+
+        FIX #3: SL orders are position-level on Bybit and never saved to the
+        orders table, so get_order_by_bybit_id always returns None for them.
+        We now fall back to looking up the trade by symbol from the WS event.
+        """
         data = msg.get("data", [])
         for item in data:
             order_id        = item.get("orderId", "")
             order_status    = item.get("orderStatus", "")
             stop_order_type = item.get("stopOrderType", "")
+            symbol          = item.get("symbol", "")
 
             if order_status == "Filled" and stop_order_type == "StopLoss":
+                # Try DB lookup first (handles any edge case where SL was saved)
                 order = await self._db.get_order_by_bybit_id(order_id)
                 if order:
                     trade = await self._db.get_trade_by_id(order["trade_id"])
-                    if trade:
-                        highest_tp = trade.get("highest_tp_hit", 0) or 0
-                        result = "WIN" if highest_tp > 0 else "LOSS"
-                        await self._db.set_last_trade_result(result)
-                        await self._db.update_trade_state(trade["id"], "sl_hit")
-                        log.warning(
-                            "SL hit for %s (TP%d reached) → result=%s",
-                            trade["symbol"], highest_tp, result,
-                        )
-                        result_emoji = "✅" if result == "WIN" else "❌"
-                        sl_price = trade.get("stop_loss", 0) or 0
-                        avg_entry = trade.get("avg_entry_price", 0) or 0
-                        await self._notify(
-                            f"🛑 *Stop-loss hit!*\n"
-                            f"Pair: `{trade['symbol']}` {trade['direction'].upper()}\n"
-                            f"SL price: `{sl_price:.6g}`\n"
-                            f"Avg entry: `{avg_entry:.6g}`\n"
-                            f"TPs hit before SL: {highest_tp}\n"
-                            f"Result: {result_emoji} *{result}*"
-                        )
+                else:
+                    # FIX #3: fall back to symbol lookup — position-level SL
+                    trade = await self._db.get_trade_by_symbol(symbol) if symbol else None
+
+                if trade:
+                    highest_tp = trade.get("highest_tp_hit", 0) or 0
+                    result = "WIN" if highest_tp > 0 else "LOSS"
+                    sl_pnl = None
+                    try:
+                        sl_pos = self._bybit.fetch_position(trade["symbol"])
+                        if sl_pos is None:  # position gone = closed
+                            sl_pnl = float(item.get("cumRealisedPnl", 0) or 0) or None
+                    except Exception:
+                        pass
+                    await self._db.set_last_trade_result(result)
+                    await self._db.close_trade(trade["id"], "sl_hit", realised_pnl=sl_pnl)
+                    log.warning(
+                        "SL hit for %s (TP%d reached) → result=%s",
+                        trade["symbol"], highest_tp, result,
+                    )
+                    result_emoji = "✅" if result == "WIN" else "❌"
+                    sl_price  = trade.get("stop_loss", 0) or 0
+                    avg_entry = trade.get("avg_entry_price", 0) or 0
+                    await self._notify(
+                        f"🛑 *Stop-loss hit!*\n"
+                        f"Pair: `{trade['symbol']}` {trade['direction'].upper()}\n"
+                        f"SL price: `{sl_price:.6g}`\n"
+                        f"Avg entry: `{avg_entry:.6g}`\n"
+                        f"TPs hit before SL: {highest_tp}\n"
+                        f"Result: {result_emoji} *{result}*"
+                    )
+                else:
+                    log.warning(
+                        "on_ws_order: SL hit event for %s but no active trade found in DB",
+                        symbol,
+                    )
 
     # ── fill-size sync (watchdog fallback) ────────────────────────────────────
 
     async def sync_fills(self):
         """
-        REST polling fallback. Runs every 30–60s from the watchdog.
-        Catches anything the WebSocket may have missed.
+        REST polling fallback. Runs every 30s from the watchdog.
+        Catches fills the WebSocket may have missed.
+
+        FIX #4: also checks whether any TP orders filled since the last poll
+        and calls on_tp_filled so the SL ratchet advances correctly.
         """
         trades = await self._db.get_active_trades()
         for trade in trades:
@@ -609,7 +905,7 @@ class TradeManager:
             avg_price = float(pos.get("avgPrice", 0)) if pos else 0.0
 
             if filled <= 0 and prev_filled > 0:
-                await self._db.update_trade_state(trade["id"], "closed")
+                await self._db.close_trade(trade["id"], "closed")
                 log.info("Sync: trade %s closed externally", symbol)
                 await self._notify(
                     f"⚠️ *Trade closed externally*\n"
@@ -637,6 +933,47 @@ class TradeManager:
                 if fresh_trade:
                     await self._refresh_tp_orders(fresh_trade, filled)
 
+            # ── FIX #4: detect missed TP fills via order status ───────────────
+            # Check each open TP order in the DB against Bybit's current order status.
+            db_open_orders = await self._db.get_open_orders_for_trade(trade["id"])
+            for order in db_open_orders:
+                if not order["order_type"].startswith("tp"):
+                    continue
+                oid = order["bybit_order_id"]
+                # Skip dry-run fake IDs
+                if oid.startswith("DRY-"):
+                    continue
+                try:
+                    resp = self._bybit._session.get_order_history(
+                        category="linear",
+                        symbol=symbol,
+                        orderId=oid,
+                        limit=1,
+                    )
+                    order_list = resp.get("result", {}).get("list", [])
+                    if not order_list:
+                        continue
+                    bybit_status = order_list[0].get("orderStatus", "")
+                    if bybit_status == "Filled":
+                        log.info(
+                            "Sync: detected missed TP fill for %s order %s",
+                            symbol, oid,
+                        )
+                        await self._db.mark_order_status(oid, "filled")
+                        try:
+                            tp_num = int(order["order_type"][2:])
+                        except ValueError:
+                            tp_num = 1
+                        await self.on_tp_filled(symbol, tp_num)
+                        # Refresh TP orders with updated position size
+                        fresh_trade = await self._db.get_trade_by_symbol(symbol)
+                        if fresh_trade and pos:
+                            remaining = float(pos.get("size", 0))
+                            if remaining > 0:
+                                await self._refresh_tp_orders(fresh_trade, remaining)
+                except Exception as exc:
+                    log.debug("Sync TP check error for %s order %s: %s", symbol, oid, exc)
+
     # ── close all ─────────────────────────────────────────────────────────────
 
     async def _handle_close_all(self, _msg: CloseAll):
@@ -648,10 +985,11 @@ class TradeManager:
             self._bybit.cancel_orders_for_symbol(sym)
             pos = self._bybit.fetch_position(sym)
             if pos:
-                size       = float(pos.get("size", 0))
-                close_side = "Sell" if pos.get("side", "Buy") == "Buy" else "Buy"
+                size = float(pos.get("size", 0))
+                # FIX #2: use trade direction as authoritative source for close side
+                close_side = _opposite_side(trade["direction"])
                 self._bybit.close_position(sym, size, close_side)
-            await self._db.update_trade_state(trade["id"], "closed")
+            await self._db.close_trade(trade["id"], "closed")
             closed_symbols.append(sym)
         log.info("Close-all complete: %d trades closed", len(trades))
         symbols_str = ", ".join(f"`{s}`" for s in closed_symbols) if closed_symbols else "none"
@@ -674,9 +1012,11 @@ class TradeManager:
         if pos:
             size       = float(pos.get("size", 0))
             upnl       = float(pos.get("unrealisedPnl", 0))
-            close_side = "Sell" if pos.get("side", "Buy") == "Buy" else "Buy"
+            # FIX #2: use trade direction as authoritative source for close side
+            close_side = _opposite_side(trade["direction"])
             self._bybit.close_position(msg.symbol, size, close_side)
-        await self._db.update_trade_state(trade["id"], "closed")
+        close_pnl = upnl if upnl != 0.0 else None
+        await self._db.close_trade(trade["id"], "closed", realised_pnl=close_pnl)
         log.info("Closed trade for %s", msg.symbol)
         pnl_emoji = "✅" if upnl >= 0 else "❌"
         await self._notify(
@@ -712,6 +1052,13 @@ class TradeManager:
         )
         for trade in trades:
             if not trade:
+                continue
+            # Guard: can't break-even with no fill yet
+            if (trade.get("filled_size", 0) or 0) <= 0:
+                log.info(
+                    "move_sl_be: %s has no fill yet — skipping break-even",
+                    trade["symbol"],
+                )
                 continue
             pos = self._bybit.fetch_position(trade["symbol"])
             if not pos:
@@ -874,7 +1221,8 @@ class TradeManager:
         close_qty  = _floor3(total_size * (percent / 100))
         if close_qty <= 0:
             return
-        close_side = "Sell" if pos.get("side", "Buy") == "Buy" else "Buy"
+        # FIX #2: use trade direction as authoritative source for close side
+        close_side = _opposite_side(trade["direction"])
         order_id   = self._bybit.place_market_order(symbol, close_side, close_qty, reduce_only=True)
         if order_id:
             await self._db.save_order(trade["id"], order_id, symbol,

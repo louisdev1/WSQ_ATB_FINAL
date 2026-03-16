@@ -1,0 +1,68 @@
+Dataset Summary (Based Only on Parsed Data)
+1. Dataset Size
+
+Total trades analyzed: 511
+
+Profitable trades: 418
+
+Loss trades: 93
+
+2. Outcome Percentages
+
+Profitable percentage: 81.80%
+
+Loss percentage: 18.20%
+
+3. Trade Result Types
+
+Full target trades: 65 (12.72%)
+
+Partial target trades: 353 (69.08%)
+
+Loss trades: 93 (18.20%)
+
+4. Target Structure
+
+Average number of targets per trade: 8.20
+
+Maximum targets detected in signals: 14
+
+5. Target Achievement
+
+Average targets hit per trade: 3.45
+
+Median targets hit per trade: 3
+
+6. Probability of Each Target Being Reached
+Target	Trades Reaching	Probability
+TP1	418	81.80%
+TP2	348	68.10%
+TP3	282	55.19%
+TP4	221	43.25%
+TP5	173	33.86%
+TP6	131	25.64%
+TP7	86	16.83%
+TP8	60	11.74%
+TP9	24	4.70%
+TP10	12	2.35%
+TP11	5	0.98%
+TP12	3	0.59%
+TP13	0	0%
+TP14	0	0%
+7. Observed Distribution
+
+Most trades reach TP1–TP4.
+
+Target probabilities decline steadily after TP5.
+
+Targets above TP8 are rarely reached.
+
+8. Overall Observations from the Data
+
+The majority of trades are profitable.
+
+Most profitable trades reach several early targets but not all targets.
+
+Full-target trades represent a small portion of total trades.
+
+Target probability decreases consistently as target number increases.
