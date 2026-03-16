@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.temp_files.config import config
+from app.config import config
 from app.monitoring.alerter import send_alert, send_recovery, format_duration
 
 log = logging.getLogger(__name__)

@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from typing import Tuple, Optional
 
-from app.temp_files.config import config
+from app.config import config
 
 log = logging.getLogger(__name__)
 
