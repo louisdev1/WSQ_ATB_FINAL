@@ -1,0 +1,58 @@
+message_id,symbol,date,error
+15,OCEANUSDT,2021-09-12T19:32:15,No candles returned
+65,LINAUSDT,2021-11-05T21:22:51,No candles returned
+73,CAKEUSDT,2021-11-08T19:15:00,No candles returned
+91,SHIBUSDT,2021-11-15T18:01:51,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773860591578}"
+95,IOTAUSDT,2021-11-17T15:22:36,No candles returned
+271,ALPHAUSDT,2022-02-04T10:30:08,No candles returned
+304,UNFIUSDT,2022-02-13T05:15:51,No candles returned
+540,SHIBUSDT,2022-04-30T20:52:44,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773860711867}"
+646,BNXUSDT,2022-06-15T22:52:07,No candles returned
+675,SHIBUSDT,2022-06-24T07:20:15,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773860739531}"
+1031,RLCUSDT,2022-09-24T20:00:15,No candles returned
+1112,1000SHIBUSDT,2022-10-18T12:06:55,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773860831289}"
+1175,RLCUSDT,2022-11-03T20:27:32,No candles returned
+1236,RAYUSDT,2022-11-12T22:19:16,No candles returned
+1629,SHIBUSDT,2023-03-15T06:37:57,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773860953725}"
+1656,DEFIUSDT,2023-03-20T19:52:41,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773860962145}"
+2625,DEFIUSDT,2023-07-13T22:22:07,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861230792}"
+2762,AVAUSDT,2023-07-31T14:02:00,No candles returned
+2876,KSMUSDT,2023-08-14T15:53:18,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773861303815}"
+2887,KAVAUSDT,2023-08-16T14:46:20,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773861306828}"
+2904,LTCUSDT,2023-08-17T21:35:05,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773861307597}"
+2930,C98USDT,2023-08-21T19:19:09,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773861308779}"
+2942,1000SHIBUSDT,2023-08-22T20:11:30,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861314116}"
+2946,DYDXUSDT,2023-08-22T22:39:40,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773861315695}"
+3712,DEFIUSDT,2023-12-20T18:15:09,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861477123}"
+4401,1000SHIBUSDT,2024-03-20T21:18:48,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861597685}"
+4425,APEUSDT,2024-03-24T21:15:47,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773861606616}"
+4581,1000SHIBUSDT,2024-04-22T23:34:04,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861648895}"
+4712,FLOKIUSDT,2024-05-17T23:45:31,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861696340}"
+4752,OCEANUSDT,2024-05-26T23:04:21,No candles returned
+4854,FETUSDT,2024-06-28T23:37:59,No candles returned
+4961,LITUSDT,2024-08-08T21:25:56,No candles returned
+4969,FLOKIUSDT,2024-08-10T15:25:16,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861767440}"
+4984,FETUSDT,2024-08-15T21:07:08,No candles returned
+5107,1000SHIBUSDT,2024-09-20T16:59:52,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861807882}"
+5179,UNFIUSDT,2024-10-18T22:24:54,No candles returned
+5436,TURBOUSDT,2024-12-06T15:26:08,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861905906}"
+5500,NEIROUSDT,2024-12-23T16:32:01,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861929759}"
+5629,DEFIUSDT,2025-02-02T14:08:39,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773861981083}"
+5780,1000WHYUSDT,2025-04-06T20:22:10,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862034721}"
+6075,LEVERUSDT,2025-06-11T00:33:37,No candles returned
+6117,1000CHEEMSUSDT,2025-06-22T22:57:09,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862123949}"
+6162,LAYERUSDT,2025-07-01T23:45:53,No candles returned
+6327,DFUSDT,2025-08-08T23:55:19,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862190872}"
+6380,CELRUSDT,2025-08-16T23:02:34,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773862208181}"
+6393,LPTUSDT,2025-08-20T15:51:20,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773862211013}"
+6397,MORPHOUSDT,2025-08-21T21:38:54,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773862212189}"
+6400,ZECUSDT,2025-08-21T23:28:29,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773862213455}"
+6408,USTCUSDT,2025-08-22T22:37:43,"Bybit API error: {'retCode': 10006, 'retMsg': 'Too many visits. Exceeded the API Rate Limit.', 'result': {}, 'retExtInfo': {}, 'time': 1773862214788}"
+6553,BEAMXUSDT,2025-10-01T07:45:54,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862260977}"
+6590,SANTOSUSDT,2025-10-17T00:51:24,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862270078}"
+6726,BDXNUSDT,2025-12-02T21:46:22,No candles returned
+6743,NEIROUSDT,2025-12-09T20:49:39,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862323215}"
+6864,TURBOUSDT,2026-01-24T20:50:58,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862378082}"
+6935,BEAMXUSDT,2026-02-14T20:09:44,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862404146}"
+6977,LAYERUSDT,2026-03-07T09:00:51,No candles returned
+6996,1MBABYDOGEUSDT,2026-03-12T13:16:14,"Bybit API error: {'retCode': 10001, 'retMsg': 'params error: Symbol Is Invalid', 'result': {}, 'retExtInfo': {}, 'time': 1773862419157}"

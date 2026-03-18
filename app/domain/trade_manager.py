@@ -18,10 +18,10 @@ Entry ladder (dynamic by range %):
 
 TP orders:    placed on first fill, qty split equally across remaining targets
 SL:           attached directly to each entry order (activates on fill)
-TP ratchet:   TP1 fills → cancel entries, move SL to avg_entry
-              TP2 fills → move SL to TP1 price
-              TP3 fills → move SL to TP2 price  (etc.)
-Break-even:   moves SL to avg entry and cancels remaining entry orders
+              SL never moves after a TP fills — backtest showed static SL
+              outperforms ratcheting by +0.76R/trade (270 trades, 2025-2026)
+TP1 fills:    cancel remaining entry orders only (no SL move)
+Break-even:   moves SL to avg entry and cancels remaining entry orders (manual command only)
 """
 
 import logging
@@ -375,7 +375,7 @@ class TradeManager:
     ):
         """
         After a restart, cancel stale DB TP records and re-place any missing
-        TP orders on Bybit so the ratchet continues working.
+        TP orders on Bybit so management continues after restart.
 
         Strategy:
           1. Fetch open reduce-only limit orders from Bybit for this symbol.
@@ -682,48 +682,32 @@ class TradeManager:
             "/".join(f"{f*100:.0f}%" for f in remaining_fractions),
         )
 
-    # ── TP ratchet ────────────────────────────────────────────────────────────
+    # ── TP fill handler ───────────────────────────────────────────────────────
 
     async def on_tp_filled(self, symbol: str, tp_num: int):
         """
         Called when a TP order fills (via WebSocket or sync_fills).
 
-        TP1: cancel remaining entries, move SL to avg_entry
-        TP2: move SL to TP1 price
-        TP3: move SL to TP2 price  (etc.)
+        Records highest_tp_hit for WIN/LOSS classification.
+        On TP1: cancels remaining entry orders (stops adding to position).
+        SL is intentionally never moved — static SL outperforms ratcheting
+        by +0.76R/trade based on 270-trade backtest (2025-2026, Bybit 1H).
         """
         trade = await self._db.get_trade_by_symbol(symbol)
         if not trade:
             log.info("on_tp_filled: no active trade for %s", symbol)
             return
 
-        targets   = trade.get("targets", [])
-        avg_entry = trade.get("avg_entry_price", 0) or 0.0
-
         await self._db.update_trade(trade["id"], highest_tp_hit=tp_num)
 
         if tp_num == 1:
-            log.info("Ratchet TP1 filled %s → cancel entries, SL→entry %.5f", symbol, avg_entry)
+            log.info("TP1 filled %s → cancelling remaining entries", symbol)
             await self._handle_cancel_entries(
                 CancelRemainingEntries(
                     raw_text="", message_type=MessageType.CANCEL_REMAINING_ENTRIES,
                     symbol=symbol,
                 )
             )
-            if avg_entry > 0:
-                ok = self._bybit.move_stop_loss(symbol, avg_entry)
-                if ok:
-                    await self._db.update_trade(trade["id"], stop_loss=avg_entry)
-        else:
-            prev_tp_price = targets[tp_num - 2] if len(targets) >= tp_num - 1 else None
-            if prev_tp_price and prev_tp_price > 0:
-                ok = self._bybit.move_stop_loss(symbol, prev_tp_price)
-                if ok:
-                    await self._db.update_trade(trade["id"], stop_loss=prev_tp_price)
-                    log.info(
-                        "Ratchet TP%d filled %s → SL→TP%d price %.5f",
-                        tp_num, symbol, tp_num - 1, prev_tp_price,
-                    )
 
     # ── WebSocket execution handler ───────────────────────────────────────────
 
@@ -816,13 +800,13 @@ class TradeManager:
                 else:
                     fresh_trade = await self._db.get_trade_by_symbol(symbol)
                     upnl = float(pos.get("unrealisedPnl", 0)) if pos else 0.0
-                    new_sl = fresh_trade.get("stop_loss", 0) if fresh_trade else 0
+                    sl_price = fresh_trade.get("stop_loss", 0) if fresh_trade else 0
                     await self._notify(
                         f"🎯 *TP{tp_num} hit!*\n"
                         f"Pair: `{symbol}` {trade['direction'].upper()}\n"
                         f"TP price: `{avg_price:.6g}` | Closed qty: {exec_qty:.4f}\n"
                         f"Remaining: {remaining:.4f} | PnL: `{upnl:+.2f} USDT`\n"
-                        f"SL ratcheted → `{new_sl:.6g}`"
+                        f"SL: `{sl_price:.6g}` (unchanged)"
                     )
                     if fresh_trade:
                         await self._refresh_tp_orders(fresh_trade, remaining)
@@ -893,7 +877,7 @@ class TradeManager:
         Catches fills the WebSocket may have missed.
 
         FIX #4: also checks whether any TP orders filled since the last poll
-        and calls on_tp_filled so the SL ratchet advances correctly.
+        and calls on_tp_filled so highest_tp_hit stays current.
         """
         trades = await self._db.get_active_trades()
         for trade in trades:
