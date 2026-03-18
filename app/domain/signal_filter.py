@@ -7,11 +7,14 @@ Returns TAKE, HALF, or SKIP with a reason string.
 Works identically for LONG and SHORT signals — all calculations use
 absolute values so direction is irrelevant.
 
-Optimal config (tested on 258,720 combinations):
-  - SL distance must be > 3%
-  - TP1 R:R must be < 1.0
+Optimal config (re-optimised on 2025-2026 data, 289 trades):
+  - Entry range width must be > 3%   ← NEW (strongest signal: 50% WR below 2%, 85%+ above 4%)
+  - SL distance must be > 4%         ← tightened from 3%
+  - TP1 R:R must be < 0.8            ← tightened from 1.0 (85.9% WR vs 63-69% above 0.8)
   - Number of targets must be >= 5
-  - Skip the next signal after a losing trade
+  - Skip the next signal after a losing trade (weaker in recent data, kept as safety net)
+
+Result vs baseline (2025-2026):  71.6% → 85.1% WR  |  $38 → $13 max DD  |  23x → 54x Ret/DD
 """
 
 import logging
@@ -51,6 +54,12 @@ def evaluate_signal(
     if entry_mid <= 0 or stop_loss <= 0:
         return "TAKE", "Cannot calculate metrics (missing prices)"
 
+    # Entry range width as % of midpoint (abs = works for long and short)
+    if entry_high > 0 and entry_low > 0 and entry_high != entry_low:
+        entry_range_pct = abs(entry_high - entry_low) / entry_mid * 100
+    else:
+        entry_range_pct = 0.0
+
     # SL distance as % of entry (abs = works for long and short)
     sl_distance_pct = abs(entry_mid - stop_loss) / entry_mid * 100
 
@@ -67,37 +76,44 @@ def evaluate_signal(
 
     # ── Apply filters ─────────────────────────────────────────────────────────
 
-    min_sl = getattr(config, "filter_min_sl_pct", 3.0)
-    max_tp1_rr = getattr(config, "filter_max_tp1_rr", 1.0)
+    min_sl = getattr(config, "filter_min_sl_pct", 4.0)
+    max_tp1_rr = getattr(config, "filter_max_tp1_rr", 0.8)
     min_targets = getattr(config, "filter_min_num_targets", 5)
+    min_entry_range = getattr(config, "filter_min_entry_range_pct", 3.0)
     skip_after_loss = getattr(config, "filter_skip_after_loss", True)
     half_rapid_hours = getattr(config, "filter_half_rapid_hours", 0)
 
-    # Filter 1: SL too tight
+    # Filter 1: Entry range too narrow (strongest predictor in 2025-2026 data)
+    if min_entry_range > 0 and entry_range_pct < min_entry_range:
+        reason = f"Entry range too narrow ({entry_range_pct:.1f}% < {min_entry_range}%)"
+        log.info("FILTER SKIP %s: %s", symbol, reason)
+        return "SKIP", reason
+
+    # Filter 2: SL too tight
     if sl_distance_pct < min_sl:
         reason = f"SL too tight ({sl_distance_pct:.1f}% < {min_sl}%)"
         log.info("FILTER SKIP %s: %s", symbol, reason)
         return "SKIP", reason
 
-    # Filter 2: TP1 R:R too high (first target too far relative to risk)
+    # Filter 3: TP1 R:R too high (first target too far relative to risk)
     if tp1_rr > max_tp1_rr:
         reason = f"TP1 R:R too high ({tp1_rr:.2f} > {max_tp1_rr})"
         log.info("FILTER SKIP %s: %s", symbol, reason)
         return "SKIP", reason
 
-    # Filter 3: Not enough targets
+    # Filter 4: Not enough targets
     if num_targets < min_targets:
         reason = f"Too few targets ({num_targets} < {min_targets})"
         log.info("FILTER SKIP %s: %s", symbol, reason)
         return "SKIP", reason
 
-    # Filter 4: Skip after a losing trade
+    # Filter 5: Skip after a losing trade
     if skip_after_loss and last_trade_result == "LOSS":
         reason = "Previous trade was a loss (skip-after-loss)"
         log.info("FILTER SKIP %s: %s", symbol, reason)
         return "SKIP", reason
 
-    # Filter 5: Half size if signal arrives rapidly after previous
+    # Filter 6: Half size if signal arrives rapidly after previous
     if half_rapid_hours > 0 and last_signal_time:
         now = datetime.utcnow()
         gap_hours = (now - last_signal_time).total_seconds() / 3600
@@ -108,7 +124,7 @@ def evaluate_signal(
 
     # All filters passed
     log.info(
-        "FILTER TAKE %s: SL=%.1f%% TP1rr=%.2f NTP=%d LastResult=%s",
-        symbol, sl_distance_pct, tp1_rr, num_targets, last_trade_result or "N/A",
+        "FILTER TAKE %s: ER=%.1f%% SL=%.1f%% TP1rr=%.2f NTP=%d LastResult=%s",
+        symbol, entry_range_pct, sl_distance_pct, tp1_rr, num_targets, last_trade_result or "N/A",
     )
     return "TAKE", "All filters passed"

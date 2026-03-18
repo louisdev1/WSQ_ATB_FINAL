@@ -67,9 +67,10 @@ def _load() -> "Config":
         dry_run=_bool("DRY_RUN", False),
         # Signal filter
         filter_enabled=_bool("FILTER_ENABLED", True),
-        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 3.0),
-        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 1.0),
+        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 4.0),
+        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 0.8),
         filter_min_num_targets=_int("FILTER_MIN_NUM_TARGETS", 5),
+        filter_min_entry_range_pct=_float("FILTER_MIN_ENTRY_RANGE_PCT", 3.0),
         filter_skip_after_loss=_bool("FILTER_SKIP_AFTER_LOSS", True),
         filter_half_rapid_hours=_float("FILTER_HALF_RAPID_HOURS", 0),
         filter_auto_scale=_bool("FILTER_AUTO_SCALE", True),
