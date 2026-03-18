@@ -44,6 +44,36 @@ from app.parsing.models import (
 log = logging.getLogger(__name__)
 
 
+# ── quality score size-up ─────────────────────────────────────────────────────
+
+def _calc_quality_score(entry_high: float, entry_low: float,
+                        stop_loss: float, targets: list) -> float:
+    """
+    Quality Score = SL% / TP1_R
+
+    Measures how wide the stop loss is relative to how close the first target
+    is. High score = wide breathing room + easy first target = high-conviction
+    entry. Backtested on 2025-2026 data: QS >= 5 wins at 88.5% WR (87/94
+    passing trades qualify, so this is the normal case not the exception).
+
+    Returns 0.0 if inputs are missing or invalid.
+    """
+    if not targets or stop_loss <= 0:
+        return 0.0
+    entry_mid = (entry_high + entry_low) / 2 if entry_high > 0 and entry_low > 0 else max(entry_high, entry_low)
+    if entry_mid <= 0:
+        return 0.0
+    sl_pct = abs(entry_mid - stop_loss) / entry_mid * 100
+    risk = abs(entry_mid - stop_loss)
+    if risk <= 0:
+        return 0.0
+    tp1_reward = abs(targets[0] - entry_mid)
+    tp1_rr = tp1_reward / risk
+    if tp1_rr <= 0:
+        return 0.0
+    return sl_pct / tp1_rr
+
+
 # ── dynamic entry ladder ──────────────────────────────────────────────────────
 
 def _calc_ladder(entry_low: float, entry_high: float) -> List[Tuple]:
@@ -526,7 +556,26 @@ class TradeManager:
                     f"SL: `{sig.stop_loss:.6g}` | Targets: {len(sig.targets)}"
                 )
                 return
+
+            # Base multiplier from filter action (HALF = 0.5×, otherwise 1.0×)
             risk_multiplier = 0.5 if action == "HALF" else 1.0
+
+            # Quality score size-up: widen margin on high-conviction setups.
+            # QS = SL% / TP1_R — high score means wide stop + close first target.
+            # Backtested 2025-2026: QS>=5 → 88.5% WR on 87/94 passing trades.
+            # Only applies on full-size trades (not when filter already halved size).
+            qs_threshold  = getattr(config, "filter_qs_threshold", 5.0)
+            qs_multiplier = getattr(config, "filter_qs_multiplier", 1.25)
+            if risk_multiplier == 1.0 and qs_threshold > 0:
+                quality_score = _calc_quality_score(
+                    sig.entry_high, sig.entry_low, sig.stop_loss, sig.targets
+                )
+                if quality_score >= qs_threshold:
+                    risk_multiplier = qs_multiplier
+                    log.info(
+                        "QS SIZE-UP %s: score=%.1f >= %.1f → %.2f× margin",
+                        sig.symbol, quality_score, qs_threshold, qs_multiplier,
+                    )
         else:
             risk_multiplier = 1.0
         # ── End filter ────────────────────────────────────────────────────────
@@ -595,7 +644,12 @@ class TradeManager:
 
         # ── Telegram notification: new trade opened ──────────────────────
         dir_emoji = "🟢" if sig.direction.value.lower() in ("long", "buy") else "🔴"
-        size_note = " (HALF size)" if risk_multiplier < 1.0 else ""
+        if risk_multiplier < 1.0:
+            size_note = " (HALF size)"
+        elif risk_multiplier > 1.0:
+            size_note = f" (SIZE UP {risk_multiplier:.2f}×)"
+        else:
+            size_note = ""
         ladder_str = "\n".join(
             f"  `{p:.6g}` — {f*100:.0f}% ({_floor3(qty * f):.4f})"
             for p, f in ladder

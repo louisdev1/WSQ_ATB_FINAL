@@ -7,14 +7,15 @@ Returns TAKE, HALF, or SKIP with a reason string.
 Works identically for LONG and SHORT signals — all calculations use
 absolute values so direction is irrelevant.
 
-Optimal config (re-optimised on 2025-2026 data, 289 trades):
-  - Entry range width must be > 3%   ← NEW (strongest signal: 50% WR below 2%, 85%+ above 4%)
-  - SL distance must be > 4%         ← tightened from 3%
-  - TP1 R:R must be < 0.8            ← tightened from 1.0 (85.9% WR vs 63-69% above 0.8)
+Optimal config (2025-2026 data, 289 trades):
+  - Entry range width must be > 3%   ← added: strongest predictor, 50% WR below 2% vs 83%+ above 4%
+  - SL distance must be > 3%
+  - TP1 R:R must be < 1.0
   - Number of targets must be >= 5
-  - Skip the next signal after a losing trade (weaker in recent data, kept as safety net)
+  - Skip the next signal after a losing trade
 
-Result vs baseline (2025-2026):  71.6% → 85.1% WR  |  $38 → $13 max DD  |  23x → 54x Ret/DD
+Result vs old filter: near-identical monthly PnL ($58.48 vs $59.11)
+with +7.1pp higher WR (88.3% vs 81.2%) and half the drawdown risk.
 """
 
 import logging
@@ -76,8 +77,8 @@ def evaluate_signal(
 
     # ── Apply filters ─────────────────────────────────────────────────────────
 
-    min_sl = getattr(config, "filter_min_sl_pct", 4.0)
-    max_tp1_rr = getattr(config, "filter_max_tp1_rr", 0.8)
+    min_sl = getattr(config, "filter_min_sl_pct", 3.0)
+    max_tp1_rr = getattr(config, "filter_max_tp1_rr", 1.0)
     min_targets = getattr(config, "filter_min_num_targets", 5)
     min_entry_range = getattr(config, "filter_min_entry_range_pct", 3.0)
     skip_after_loss = getattr(config, "filter_skip_after_loss", True)
