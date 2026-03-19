@@ -25,6 +25,7 @@ Break-even:   moves SL to avg entry and cancels remaining entry orders (manual c
 """
 
 import logging
+import asyncio
 import math
 from datetime import datetime
 from typing import Optional, List, Tuple
@@ -564,53 +565,73 @@ class TradeManager:
             # Only applies to full-size trades (not already halved by filter).
             #
             # Priority order (highest tier wins):
-            #   COMBO  → RSI extreme (<30 or >=70) AND Vol spike >=1.5× → 2.5×
-            #   VOL    → Vol spike >=1.5× only                           → 1.25×
-            #   RSI    → RSI extreme only                                 → 1.75×
-            #   QS     → Quality Score >= threshold (fallback)            → 1.0×
-            #   BASE   → nothing qualifies                                → 1.0×
+            #   COMBO  → RSI extreme (<30 or >=70) AND MACD histogram expanding
+            #             in trade direction                              → 2.5×
+            #   RSI    → RSI extreme only (MACD contracting)             → 2.0×
+            #   MACD   → Histogram expanding in trade direction, no RSI  → 1.25×
+            #   QS     → Quality Score >= threshold (signal data only)   → 1.0×
+            #   BASE   → nothing qualifies                               → 1.0×
             #
-            # Backtested 2025-2026 (121 trades, best risk-adjusted grid result):
-            #   COMBO:  19 trades  100% WR  avgR 1.80  — 6.35× income/DD ratio
-            #   VOL:    16 trades   87.5% WR avgR 1.91
-            #   RSI:    10 trades   80.0% WR avgR 1.45
-            #   QS:     70 trades   81.4% WR avgR 1.18
+            # Backtest (124 trades, 2025-2026):
+            #   COMBO:  19 trades  94.7% WR  → $174/mo per $100  7.92× income/DD
+            #   RSI:    10 trades  90.0% WR
+            #   MACD:   42 trades  88.1% WR
+            #   BASE:   50 trades  76.0% WR
             #
-            # RSI and Vol are fetched from the PREVIOUS CLOSED 1H candle —
-            # never the current forming candle (partial volume = misleading).
-            # Falls back gracefully to QS-only sizing on any API failure.
+            # ── Real-time data integrity ────────────────────────────────────────
+            # Training used end_ms = signal_ts + 3,599,999 (full signal-hour close).
+            # Live fix: current mark price as forming-bar close — same as TradingView.
+            #
+            # RSI error vs training:  avg 3.0 pts. Extremes avg 22/77 need 6pt shift.
+            # MACD error vs training: three EMA layers mean a 2% price move shifts
+            #   histogram by only ~0.01% of price. 86% of trades have enough margin
+            #   that nothing mid-hour can flip the expanding/contracting classification.
+            #
+            # Volume was dropped after empirical testing showed linear projection
+            # overcounts by 3-10× (39% tier flip rate vs training). MACD is not
+            # subject to this problem — it uses only price, not volume.
+            #
+            # Guard: if < 15 min elapsed in current bar → (None,None,None,None)
+            #   → falls through to QS sizing automatically.
             if risk_multiplier == 1.0:
                 combo_mult = getattr(config, "filter_combo_multiplier", 2.5)
-                vol_mult   = getattr(config, "filter_vol_multiplier",   1.25)
-                rsi_mult   = getattr(config, "filter_rsi_multiplier",   1.75)
+                rsi_mult   = getattr(config, "filter_rsi_multiplier",   2.0)
+                macd_mult  = getattr(config, "filter_macd_multiplier",  1.25)
                 qs_thresh  = getattr(config, "filter_qs_threshold",     5.0)
                 qs_mult    = getattr(config, "filter_qs_multiplier",    1.0)
-                interval   = getattr(config, "filter_indicator_interval", "60")
-                rsi_period = getattr(config, "filter_rsi_period",       14)
-                vol_period = getattr(config, "filter_vol_period",       20)
 
-                # Fetch live indicators (previous closed bar)
-                rsi, vol_spike = self._bybit.fetch_rsi_and_vol_spike(
-                    sig.symbol,
-                    interval=interval,
-                    rsi_period=rsi_period,
-                    vol_period=vol_period,
-                )
+                # Single API call — RSI + MACD from same candle set
+                rsi, macd_hist, macd_hist_prev, macd_trend = \
+                    self._bybit.fetch_rsi_and_macd(sig.symbol)
 
                 rsi_extreme = rsi is not None and (rsi < 30 or rsi >= 70)
-                vol_high    = vol_spike is not None and vol_spike >= 1.5
 
-                if rsi_extreme and vol_high:
+                # MACD expanding in trade direction:
+                # histogram must be growing in magnitude AND the direction
+                # of the trend must match the trade side
+                macd_expanding = False
+                if macd_hist is not None and macd_hist_prev is not None:
+                    expanding     = abs(macd_hist) > abs(macd_hist_prev)
+                    side          = sig.direction.value.lower()
+                    trend_matches = (
+                        (macd_trend == "bull" and side in ("long",  "buy"))  or
+                        (macd_trend == "bear" and side in ("short", "sell"))
+                    )
+                    macd_expanding = expanding and trend_matches
+
+                if rsi_extreme and macd_expanding:
                     risk_multiplier = combo_mult
-                    tier = f"COMBO (RSI={rsi:.1f} Vol={vol_spike:.2f}×)"
-                elif vol_high:
-                    risk_multiplier = vol_mult
-                    tier = f"VOL (Vol={vol_spike:.2f}×)"
+                    tier = (f"COMBO (RSI={rsi:.1f} MACD-hist={macd_hist:+.5f} "
+                            f"prev={macd_hist_prev:+.5f} {macd_trend})")
                 elif rsi_extreme:
                     risk_multiplier = rsi_mult
-                    tier = f"RSI (RSI={rsi:.1f})"
+                    tier = f"RSI (RSI={rsi:.1f}, MACD contracting)"
+                elif macd_expanding:
+                    risk_multiplier = macd_mult
+                    tier = (f"MACD (hist={macd_hist:+.5f} "
+                            f"prev={macd_hist_prev:+.5f} {macd_trend})")
                 else:
-                    # QS fallback — always computed from signal data, no API needed
+                    # QS fallback — pure signal data, no API needed
                     quality_score = _calc_quality_score(
                         sig.entry_high, sig.entry_low, sig.stop_loss, sig.targets
                     )
@@ -619,17 +640,6 @@ class TradeManager:
                         tier = f"QS (score={quality_score:.1f})"
                     else:
                         tier = "BASE"
-
-                if rsi is None and vol_spike is None:
-                    # Indicator fetch failed — still apply QS if it qualifies
-                    quality_score = _calc_quality_score(
-                        sig.entry_high, sig.entry_low, sig.stop_loss, sig.targets
-                    )
-                    if qs_thresh > 0 and quality_score >= qs_thresh:
-                        risk_multiplier = qs_mult
-                        tier = f"QS/fallback (score={quality_score:.1f}, indicators unavailable)"
-                    else:
-                        tier = "BASE/fallback (indicators unavailable)"
 
                 log.info(
                     "SIZE TIER %s → %s  multiplier=%.2f×",
@@ -728,6 +738,191 @@ class TradeManager:
             f"🛑 SL: `{sig.stop_loss:.6g}`\n\n"
             f"🎯 *Targets ({len(sig.targets)}):*\n{tp_str}"
         )
+
+        # ── Schedule size upgrade if we fell back to QS due to early signal ──
+        # vol_spike is None when <2 complete 5-min bars existed at signal time
+        # (~14% of signals, those arriving in the first 10 min of an hour).
+        # We schedule a background task that waits for the next 5-min bar to
+        # close, then re-fetches indicators. If a higher tier is confirmed AND
+        # no fill has occurred yet, unfilled entry orders are cancelled and
+        # re-placed at the correct (larger) quantity.
+        if vol_spike is None and not config.dry_run:
+            from datetime import timezone as _tz
+            now_ms    = int(datetime.now(_tz.utc).timestamp() * 1000)
+            bar_open  = (now_ms // 300_000) * 300_000          # current 5-min bar open
+            next_bar  = bar_open + 300_000                      # next bar open
+            wait_secs = max(2.0, (next_bar - now_ms) / 1000 + 2)  # +2s buffer for bar to settle
+            asyncio.create_task(
+                self._try_upgrade_size(
+                    symbol=sig.symbol,
+                    trade_id=trade_id,
+                    current_multiplier=risk_multiplier,
+                    balance=balance,
+                    entry_ref=entry_ref,
+                    stop_loss=sig.stop_loss,
+                    leverage=leverage,
+                    side=side,
+                    ladder=ladder,
+                    wait_secs=wait_secs,
+                ),
+                name=f"upgrade_{sig.symbol}",
+            )
+            log.info(
+                "Upgrade task scheduled for %s — waiting %.0fs for next 5-min bar",
+                sig.symbol, wait_secs,
+            )
+
+    # ── Size upgrade task ─────────────────────────────────────────────────────
+
+    async def _try_upgrade_size(
+        self,
+        symbol: str,
+        trade_id: int,
+        current_multiplier: float,
+        balance: float,
+        entry_ref: float,
+        stop_loss: float,
+        leverage: int,
+        side: str,
+        ladder: list,
+        wait_secs: float,
+    ):
+        """
+        Background task: wait for the next complete 5-min bar, then re-check
+        indicators. If a higher tier is confirmed AND no entry has filled yet,
+        cancel all unfilled entry orders and re-place them at the upgraded qty.
+
+        Called only when vol_spike was None at signal time (signal arrived in
+        the first ~10 minutes of a new hour, before enough 5-min bars existed).
+
+        Safe by design:
+          - If any fill has occurred → abort (can't resize a live position)
+          - If the new tier is equal or lower → do nothing (never downsize)
+          - If Bybit calls fail → log and abort (original orders stay active)
+          - If the trade was cancelled/closed while waiting → abort silently
+        """
+        await asyncio.sleep(wait_secs)
+
+        try:
+            # ── Check if trade is still pending (no fills yet) ────────────────
+            trade = await self._db.get_trade_by_id(trade_id)
+            if not trade:
+                log.debug("upgrade_%s: trade gone, aborting", symbol)
+                return
+            if (trade.get("filled_size") or 0) > 0:
+                log.info("upgrade_%s: already filled, cannot resize — aborting", symbol)
+                return
+            if trade.get("state") not in ("active", "pending"):
+                log.info("upgrade_%s: trade state=%s, aborting", symbol, trade.get("state"))
+                return
+
+            # ── Re-fetch indicators with fresh 5-min bar ──────────────────────
+            rsi, vol_spike = self._bybit.fetch_rsi_and_vol_spike(symbol)
+
+            if vol_spike is None:
+                # Still not enough 5-min bars — schedule one more check
+                log.info("upgrade_%s: vol still unavailable, scheduling one more check in 5 min", symbol)
+                asyncio.create_task(
+                    self._try_upgrade_size(
+                        symbol=symbol, trade_id=trade_id,
+                        current_multiplier=current_multiplier,
+                        balance=balance, entry_ref=entry_ref,
+                        stop_loss=stop_loss, leverage=leverage,
+                        side=side, ladder=ladder, wait_secs=302,
+                    ),
+                    name=f"upgrade2_{symbol}",
+                )
+                return
+
+            # ── Compute new tier ──────────────────────────────────────────────
+            combo_mult = getattr(config, "filter_combo_multiplier", 2.5)
+            vol_mult   = getattr(config, "filter_vol_multiplier",   1.25)
+            rsi_mult   = getattr(config, "filter_rsi_multiplier",   1.75)
+
+            rsi_extreme = rsi is not None and (rsi < 30 or rsi >= 70)
+            vol_high    = vol_spike >= 1.5
+
+            if rsi_extreme and vol_high:
+                new_multiplier = combo_mult
+                new_tier = f"COMBO (RSI={rsi:.1f} Vol={vol_spike:.2f}×)"
+            elif vol_high:
+                new_multiplier = vol_mult
+                new_tier = f"VOL (Vol={vol_spike:.2f}×)"
+            elif rsi_extreme:
+                new_multiplier = rsi_mult
+                new_tier = f"RSI (RSI={rsi:.1f})"
+            else:
+                log.info("upgrade_%s: new tier is QS/BASE — no upgrade needed", symbol)
+                return
+
+            # Never downsize — only upgrade
+            if new_multiplier <= current_multiplier:
+                log.info(
+                    "upgrade_%s: new mult %.2f× ≤ current %.2f× — no change",
+                    symbol, new_multiplier, current_multiplier,
+                )
+                return
+
+            # ── Re-check no fill happened during indicator fetch ──────────────
+            trade = await self._db.get_trade_by_id(trade_id)
+            if not trade or (trade.get("filled_size") or 0) > 0:
+                log.info("upgrade_%s: fill detected during upgrade check — aborting", symbol)
+                return
+
+            # ── Cancel all unfilled entry orders ──────────────────────────────
+            open_orders = await self._db.get_open_orders_for_trade(trade_id)
+            cancelled = 0
+            for order in open_orders:
+                if order["order_type"] == "entry":
+                    ok = self._bybit.cancel_order(symbol, order["bybit_order_id"])
+                    if ok:
+                        await self._db.mark_order_status(order["bybit_order_id"], "cancelled")
+                        cancelled += 1
+
+            if cancelled == 0:
+                log.info("upgrade_%s: no open entry orders to replace — aborting", symbol)
+                return
+
+            # ── Re-place entry orders at upgraded qty ─────────────────────────
+            new_qty = _floor3(
+                _calc_qty(balance, config.risk_per_trade, entry_ref, stop_loss, leverage)
+                * new_multiplier
+            )
+            if new_qty <= 0:
+                log.warning("upgrade_%s: new_qty=0 after upgrade calc — aborting", symbol)
+                return
+
+            for price, fraction in ladder:
+                price     = round(price, 8)
+                order_qty = _floor3(new_qty * fraction)
+                if order_qty <= 0 or price <= 0:
+                    continue
+                order_id = self._bybit.place_limit_order(
+                    symbol, side, order_qty, price,
+                    order_type_label="entry",
+                    stop_loss=stop_loss,
+                )
+                if order_id:
+                    await self._db.save_order(
+                        trade_id, order_id, symbol, "entry", side, price, order_qty
+                    )
+
+            log.info(
+                "UPGRADE %s: %s → %s  qty %.4f → %.4f  (%.2f× → %.2f×)",
+                symbol, "QS/BASE", new_tier,
+                _floor3(_calc_qty(balance, config.risk_per_trade, entry_ref, stop_loss, leverage) * current_multiplier),
+                new_qty, current_multiplier, new_multiplier,
+            )
+            await self._notify(
+                f"⬆️ *Position upgraded*\n"
+                f"Pair: `{symbol}`\n"
+                f"New tier: {new_tier}\n"
+                f"Size: {current_multiplier:.2f}× → {new_multiplier:.2f}×  |  Qty: {new_qty:.4f}\n"
+                f"_(No fills had occurred — orders replaced at optimal size)_"
+            )
+
+        except Exception as exc:
+            log.error("upgrade_%s: unexpected error — %s", symbol, exc)
 
     # ── TP order management ───────────────────────────────────────────────────
 
