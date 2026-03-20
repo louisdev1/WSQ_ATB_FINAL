@@ -7,25 +7,18 @@ Tracks:
 - Unprotected positions (no SL)
 - Log tail scanning for tracebacks
 
-Sends recovery ("all clear") messages when issues resolve.
-
-Thread-safety note: report_*_ok / report_*_fail are called from pybit's
-internal WebSocket thread.  They now schedule state updates onto the asyncio
-event loop via _loop_ref rather than writing to globals from a foreign thread.
-The watchdog loop reads the flags only from the event loop, so there is no
-data race.
+Never alerts for: successful self-recoveries, ignored signals, commentary.
 """
 
 import asyncio
 import logging
 import re
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from app.config import config
-from app.monitoring.alerter import send_alert, send_recovery, format_duration
+from app.monitoring.alerter import send_alert
 
 log = logging.getLogger(__name__)
 
@@ -40,17 +33,10 @@ class IssueTracker:
             self._issues[key] = datetime.now(timezone.utc)
             log.debug("Issue first seen: %s", key)
 
-    def clear(self, key: str) -> float:
-        """Clear an issue and return how long it lasted (0.0 if not tracked)."""
+    def clear(self, key: str):
         if key in self._issues:
-            duration = (datetime.now(timezone.utc) - self._issues[key]).total_seconds()
             del self._issues[key]
-            log.debug("Issue resolved: %s (lasted %.0fs)", key, duration)
-            return duration
-        return 0.0
-
-    def is_active(self, key: str) -> bool:
-        return key in self._issues
+            log.debug("Issue resolved: %s", key)
 
     def age_seconds(self, key: str) -> float:
         if key not in self._issues:
@@ -60,71 +46,34 @@ class IssueTracker:
 
 _tracker = IssueTracker()
 
-# ── connectivity flags ────────────────────────────────────────────────────────
-# Read ONLY from the asyncio event loop (watchdog_loop).
-# Written via _schedule_flag_update() which is safe to call from any thread.
+# ── connectivity flags (set by intake/exchange layers) ────────────────────────
 
 _telegram_ok: bool = True
 _bybit_ok: bool = True
-_telegram_was_down: bool = False
-_bybit_was_down: bool = False
-
-# Reference to the running event loop — set once by watchdog_loop at startup.
-_loop_ref: Optional[asyncio.AbstractEventLoop] = None
-_loop_lock = threading.Lock()
-
-
-def _schedule_flag_update(fn):
-    """
-    Thread-safe helper.  If called from the event-loop thread, run fn directly.
-    If called from any other thread (e.g. pybit WS thread), schedule it onto
-    the event loop so globals are always written from the loop thread.
-    """
-    with _loop_lock:
-        loop = _loop_ref
-    if loop is None:
-        # Loop not started yet — run directly (startup path, single-threaded)
-        fn()
-        return
-    try:
-        if loop.is_running():
-            loop.call_soon_threadsafe(fn)
-        else:
-            fn()
-    except RuntimeError:
-        fn()
 
 
 def report_telegram_ok():
-    def _do():
-        global _telegram_ok
-        _telegram_ok = True
-        _tracker.clear("telegram_down")
-    _schedule_flag_update(_do)
+    global _telegram_ok
+    _telegram_ok = True
+    _tracker.clear("telegram_down")
 
 
 def report_telegram_fail():
-    def _do():
-        global _telegram_ok
-        _telegram_ok = False
-        _tracker.mark("telegram_down")
-    _schedule_flag_update(_do)
+    global _telegram_ok
+    _telegram_ok = False
+    _tracker.mark("telegram_down")
 
 
 def report_bybit_ok():
-    def _do():
-        global _bybit_ok
-        _bybit_ok = True
-        _tracker.clear("bybit_down")
-    _schedule_flag_update(_do)
+    global _bybit_ok
+    _bybit_ok = True
+    _tracker.clear("bybit_down")
 
 
 def report_bybit_fail():
-    def _do():
-        global _bybit_ok
-        _bybit_ok = False
-        _tracker.mark("bybit_down")
-    _schedule_flag_update(_do)
+    global _bybit_ok
+    _bybit_ok = False
+    _tracker.mark("bybit_down")
 
 
 # ── log tail watcher ──────────────────────────────────────────────────────────
@@ -167,29 +116,13 @@ async def _check_unprotected_positions(db, bybit) -> None:
                 _tracker.mark(f"no_sl_{sym}")
                 age = _tracker.age_seconds(f"no_sl_{sym}")
                 if age > config.alert_sl_seconds:
-                    size       = float(pos.get("size", 0))
-                    avg_price  = float(pos.get("avgPrice", 0))
-                    mark_price = float(pos.get("markPrice", 0))
-                    upnl       = float(pos.get("unrealisedPnl", 0))
-                    side       = pos.get("side", "?")
                     await send_alert(
                         f"no_sl_{sym}",
-                        f"⚠️ Position *{sym}* has NO stop-loss for {format_duration(age)}!\n"
-                        f"Side: {side} | Size: {size}\n"
-                        f"Entry: `{avg_price:.6g}` | Mark: `{mark_price:.6g}`\n"
-                        f"PnL: `{upnl:+.2f} USDT`\n\n"
-                        f"⚡ _Set a stop-loss immediately!_",
+                        f"⚠️ Position {sym} appears to have NO stop-loss! Age: {age:.0f}s",
                         db,
                     )
             else:
-                # SL is now present — send recovery if it was missing before
-                duration = _tracker.clear(f"no_sl_{sym}")
-                if duration > config.alert_sl_seconds:
-                    await send_recovery(
-                        f"no_sl_{sym}",
-                        f"Stop-loss restored for *{sym}* (was missing for {format_duration(duration)}).",
-                        db,
-                    )
+                _tracker.clear(f"no_sl_{sym}")
     except Exception as exc:
         log.error("Unprotected position check error: %s", exc)
 
@@ -198,50 +131,28 @@ async def _check_unprotected_positions(db, bybit) -> None:
 
 async def watchdog_loop(db, bybit, trade_manager):
     """Runs forever in the background. Check interval: 30s."""
-    global _telegram_was_down, _bybit_was_down, _loop_ref
-
-    # Capture the running loop so report_* helpers can schedule onto it
-    with _loop_lock:
-        _loop_ref = asyncio.get_running_loop()
-
     log.info("Watchdog started")
     while True:
         try:
-            # ── Telegram connectivity ──────────────────────────────────────
+            # Telegram connectivity check
             if not _telegram_ok:
-                _telegram_was_down = True
                 age = _tracker.age_seconds("telegram_down")
                 if age > config.alert_telegram_seconds:
                     await send_alert(
                         "telegram_down",
-                        f"Telegram listener has been down for {format_duration(age)} and has not recovered.",
+                        f"Telegram listener has been down for {age:.0f}s and has not recovered.",
                         db,
                     )
-            elif _telegram_was_down:
-                _telegram_was_down = False
-                await send_recovery(
-                    "telegram_down",
-                    "Telegram listener has reconnected and is receiving signals again.",
-                    db,
-                )
 
-            # ── Bybit connectivity ─────────────────────────────────────────
+            # Bybit connectivity check
             if not _bybit_ok:
-                _bybit_was_down = True
                 age = _tracker.age_seconds("bybit_down")
                 if age > config.alert_bybit_seconds:
                     await send_alert(
                         "bybit_down",
-                        f"Bybit API has been unreachable for {format_duration(age)}.",
+                        f"Bybit API has been unreachable for {age:.0f}s.",
                         db,
                     )
-            elif _bybit_was_down:
-                _bybit_was_down = False
-                await send_recovery(
-                    "bybit_down",
-                    "Bybit API connection restored.",
-                    db,
-                )
 
             # Log tail scan
             await _check_log_for_tracebacks(db)
@@ -249,9 +160,13 @@ async def watchdog_loop(db, bybit, trade_manager):
             # Unprotected positions
             await _check_unprotected_positions(db, bybit)
 
-            # Sync fills (REST fallback + missed TP detection)
+            # Sync fills (REST fallback)
             if trade_manager:
                 await trade_manager.sync_fills()
+
+            # Blowthrough cancel — check if price has moved through entry zone
+            if trade_manager:
+                await trade_manager.check_blowthrough()
 
         except Exception as exc:
             log.error("Watchdog loop error: %s", exc)

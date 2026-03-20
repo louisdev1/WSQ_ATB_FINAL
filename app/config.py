@@ -1,43 +1,34 @@
 """
 config.py – Load .env and expose a single Config object.
 
-The project root is always derived from this file's location on disk —
-no PATH or PROJECT_PATH variable is needed or read for path resolution.
-This avoids collisions with the system PATH environment variable on all
-platforms (Windows, Linux, Raspberry Pi).
-
-Path variables in .env (BOT_LOG_FILE, DB_PATH, SESSION_DIR) still support
-the ${PROJECT_PATH} placeholder for explicit overrides, but the defaults
-work correctly with no configuration at all.
+PATH in .env is the project root. All other paths are derived from it.
+Works on Windows and Raspberry Pi without any code changes.
 """
 
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Project root is always the parent of the directory containing this file.
-# config.py lives at  <project_root>/app/config.py
-# so project_root    = Path(__file__).resolve().parent.parent
-_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
-
-def _resolve_env_path(raw: str) -> Path:
-    """Replace ${PROJECT_PATH} placeholder and return an absolute Path."""
-    resolved = raw.replace("${PROJECT_PATH}", str(_PROJECT_ROOT))
-    resolved = resolved.replace("${PATH}", str(_PROJECT_ROOT))   # legacy compat
+def _resolve_env_path(raw: str, project_root: Path) -> Path:
+    resolved = raw.replace("${PATH}", str(project_root))
     p = Path(resolved)
     if not p.is_absolute():
-        p = _PROJECT_ROOT / p
+        p = project_root / p
     return p
 
 
 def _load() -> "Config":
-    env_file = _PROJECT_ROOT / ".env"
+    here = Path(__file__).resolve().parent.parent
+    env_file = here / ".env"
     load_dotenv(dotenv_path=env_file, override=True)
+
+    raw_path = os.getenv("PATH", str(here))
+    project_root = Path(raw_path) if Path(raw_path).exists() else here
 
     def _p(key: str, default: str) -> Path:
         raw = os.getenv(key, default)
-        return _resolve_env_path(raw)
+        return _resolve_env_path(raw, project_root)
 
     def _bool(key: str, default: bool) -> bool:
         return os.getenv(key, str(default)).lower() in ("1", "true", "yes")
@@ -49,46 +40,61 @@ def _load() -> "Config":
         return float(os.getenv(key, str(default)))
 
     return Config(
-        project_root=_PROJECT_ROOT,
-        # Telegram
+        project_root=project_root,
+
+        # ── Telegram ──────────────────────────────────────────────────────────
         telegram_api_id=_int("TELEGRAM_API_ID", 0),
         telegram_api_hash=os.getenv("TELEGRAM_API_HASH", ""),
         telegram_phone=os.getenv("TELEGRAM_PHONE", ""),
         telegram_session_name=os.getenv("TELEGRAM_SESSION_NAME", "telegram_session"),
         telegram_group_name=os.getenv("TELEGRAM_GROUP_NAME", ""),
-        # Bybit
+
+        # ── Bybit ─────────────────────────────────────────────────────────────
         bybit_api_key=os.getenv("BYBIT_API_KEY", ""),
         bybit_api_secret=os.getenv("BYBIT_API_SECRET", ""),
         bybit_testnet=_bool("BYBIT_TESTNET", False),
-        # Risk
+
+        # ── Risk & sizing ─────────────────────────────────────────────────────
         default_leverage=_int("DEFAULT_LEVERAGE", 10),
         max_leverage=_int("MAX_LEVERAGE", 10),
-        risk_per_trade=_float("RISK_PER_TRADE", 0.15),
+        risk_per_trade=_float("RISK_PER_TRADE", 0.10),
+        short_size_multiplier=_float("SHORT_SIZE_MULTIPLIER", 1.5),
         dry_run=_bool("DRY_RUN", False),
-        # Signal filter
+
+        # ── Blowthrough cancel ────────────────────────────────────────────────
+        # When ON: if price moves to entry_mid while entries pending → cancel all
+        # This removes 41% WR "full zone" trades and keeps 88% WR "edge/mid" trades
+        blowthrough_cancel=_bool("BLOWTHROUGH_CANCEL", True),
+
+        # ── Signal quality filter ─────────────────────────────────────────────
+        # Signals that don't pass are ignored (no orders placed)
         filter_enabled=_bool("FILTER_ENABLED", True),
-        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 3.0),
-        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 1.0),
-        filter_min_num_targets=_int("FILTER_MIN_NUM_TARGETS", 5),
         filter_min_entry_range_pct=_float("FILTER_MIN_ENTRY_RANGE_PCT", 3.0),
-        filter_qs_threshold=_float("FILTER_QS_THRESHOLD", 5.0),
-        filter_qs_multiplier=_float("FILTER_QS_MULTIPLIER", 1.0),
+        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 0.0),
+        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 0.9),
+        filter_min_num_targets=_int("FILTER_MIN_NUM_TARGETS", 6),
+
+        # ── RSI/MACD tier sizing multipliers ─────────────────────────────────
+        # When RSI/MACD confirm setup → size up position
+        # Only applies AFTER blowthrough cancel (so only on good trades)
+        filter_rsi_low=_int("FILTER_RSI_LOW", 30),
+        filter_rsi_high=_int("FILTER_RSI_HIGH", 70),
+        filter_rsi_period=_int("FILTER_RSI_PERIOD", 14),
+        filter_indicator_interval=_int("FILTER_INDICATOR_INTERVAL", 60),
         filter_combo_multiplier=_float("FILTER_COMBO_MULTIPLIER", 2.5),
         filter_rsi_multiplier=_float("FILTER_RSI_MULTIPLIER", 2.0),
         filter_macd_multiplier=_float("FILTER_MACD_MULTIPLIER", 1.25),
-        filter_rsi_period=_int("FILTER_RSI_PERIOD", 14),
-        filter_indicator_interval=os.getenv("FILTER_INDICATOR_INTERVAL", "60"),
-        filter_skip_after_loss=_bool("FILTER_SKIP_AFTER_LOSS", False),
-        filter_half_rapid_hours=_float("FILTER_HALF_RAPID_HOURS", 0),
-        filter_auto_scale=_bool("FILTER_AUTO_SCALE", True),
-        # Alert bot
+        filter_qs_multiplier=_float("FILTER_QS_MULTIPLIER", 1.5),
+        filter_qs_threshold=_float("FILTER_QS_THRESHOLD", 5.0),
+
+        # ── Paths ─────────────────────────────────────────────────────────────
+        log_file=_p("BOT_LOG_FILE", "${PATH}/logs/bot.log"),
+        db_path=_p("DB_PATH", "${PATH}/data/bot.db"),
+        session_dir=_p("SESSION_DIR", "${PATH}/sessions"),
+
+        # ── Alert bot ─────────────────────────────────────────────────────────
         alert_bot_token=os.getenv("ALERT_BOT_TOKEN", ""),
         alert_chat_id=os.getenv("ALERT_CHAT_ID", ""),
-        # Paths — defaults are relative to project root, no config needed
-        log_file=_p("BOT_LOG_FILE", "${PROJECT_PATH}/logs/bot.log"),
-        db_path=_p("DB_PATH", "${PROJECT_PATH}/data/bot.db"),
-        session_dir=_p("SESSION_DIR", "${PROJECT_PATH}/sessions"),
-        # Alert thresholds
         alert_telegram_seconds=_int("ALERT_TELEGRAM_SECONDS", 120),
         alert_bybit_seconds=_int("ALERT_BYBIT_SECONDS", 180),
         alert_sl_seconds=_int("ALERT_SL_SECONDS", 90),
@@ -103,12 +109,7 @@ class Config:
             setattr(self, k, v)
 
     def ensure_dirs(self):
-        """Create all necessary directories if they don't exist."""
-        for d in (
-            self.log_file.parent,
-            self.db_path.parent,
-            self.session_dir,
-        ):
+        for d in (self.log_file.parent, self.db_path.parent, self.session_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 
