@@ -70,22 +70,25 @@ def _load() -> "Config":
         # Signals that don't pass are ignored (no orders placed)
         filter_enabled=_bool("FILTER_ENABLED", True),
         filter_min_entry_range_pct=_float("FILTER_MIN_ENTRY_RANGE_PCT", 3.0),
-        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 0.0),
-        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 0.9),
         filter_min_num_targets=_int("FILTER_MIN_NUM_TARGETS", 6),
 
-        # ── RSI/MACD tier sizing multipliers ─────────────────────────────────
-        # When RSI/MACD confirm setup → size up position
-        # Only applies AFTER blowthrough cancel (so only on good trades)
-        filter_rsi_low=_int("FILTER_RSI_LOW", 30),
-        filter_rsi_high=_int("FILTER_RSI_HIGH", 70),
-        filter_rsi_period=_int("FILTER_RSI_PERIOD", 14),
-        filter_indicator_interval=_int("FILTER_INDICATOR_INTERVAL", 60),
-        filter_combo_multiplier=_float("FILTER_COMBO_MULTIPLIER", 2.5),
-        filter_rsi_multiplier=_float("FILTER_RSI_MULTIPLIER", 2.0),
-        filter_macd_multiplier=_float("FILTER_MACD_MULTIPLIER", 1.25),
-        filter_qs_multiplier=_float("FILTER_QS_MULTIPLIER", 1.5),
-        filter_qs_threshold=_float("FILTER_QS_THRESHOLD", 5.0),
+        # ── RSI filter (Binance API) ──────────────────────────────────────────
+        # Core confirmed edge: RSI 1h < 40 gives WR 79.4% Sharpe +0.622
+        # Fetched from Binance public API at signal time (no key needed)
+        filter_rsi_signal_max=_int("FILTER_RSI_SIGNAL_MAX", 40),
+        filter_rsi_tf=os.getenv("FILTER_RSI_TF", "1h"),
+
+        # ── SL distance filters ───────────────────────────────────────────────
+        # filter_min_sl_pct: skip signals where SL is too tight (noise wicks)
+        # filter_max_sl_pct: skip signals where SL is too wide (bad R ratio)
+        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 3.0),
+        filter_max_sl_pct=_float("FILTER_MAX_SL_PCT", 0.0),   # 0 = disabled
+
+        # ── TP1 R:R maximum ───────────────────────────────────────────────────
+        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 1.1),
+
+        # ── BTC weekly filter ─────────────────────────────────────────────────
+        filter_btc_weekly_enabled=_bool("FILTER_BTC_WEEKLY_ENABLED", True),
 
         # ── Paths ─────────────────────────────────────────────────────────────
         log_file=_p("BOT_LOG_FILE", "${PATH}/logs/bot.log"),

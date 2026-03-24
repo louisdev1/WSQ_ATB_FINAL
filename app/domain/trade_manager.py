@@ -20,6 +20,7 @@ from typing import Optional, List, Tuple
 from app.config import config
 from app.exchange.bybit_client import BybitClient
 from app.storage.database import Database
+from app.domain.signal_filter import evaluate_signal
 from app.parsing.models import (
     ParsedMessage, MessageType, Direction,
     NewSignal, CloseAll, CloseSymbol, CancelRemainingEntries,
@@ -38,21 +39,25 @@ def _is_long(direction: str) -> bool:
 
 def _calc_ladder(entry_low: float, entry_high: float, direction: str) -> List[Tuple]:
     """
-    Direction-aware ladder.
-    LONG:  65% at entry_high (easiest fill) → 25% mid → 10% entry_low
-    SHORT: 65% at entry_low  (easiest fill) → 25% mid → 10% entry_high
+    Single limit order — 100% of position at the zone edge.
+
+    Confirmed optimal from backtesting analysis (Jan 2024 – May 2025):
+      - 35% blowthrough cancel makes entry_mid unreachable on first touch
+      - entry_mid order never fills for kept trades
+      - 100% at zone edge gives identical R per trade, lower complexity
+
+    LONG:  100% at entry_high  (price must dip to here to fill)
+    SHORT: 100% at entry_low   (price must rise to here to fill)
     Single-price signals: 100% at that price.
     """
     if entry_low <= 0 or entry_high <= entry_low:
         price = entry_high if entry_high > 0 else entry_low
         return [(price, 1.0)]
 
-    midpoint = (entry_low + entry_high) / 2
-
     if _is_long(direction):
-        return [(entry_high, 0.65), (midpoint, 0.25), (entry_low, 0.10)]
+        return [(entry_high, 1.0)]
     else:
-        return [(entry_low, 0.65), (midpoint, 0.25), (entry_high, 0.10)]
+        return [(entry_low, 1.0)]
 
 
 def _opposite_side(direction: str) -> str:
@@ -82,21 +87,25 @@ def _floor3(v: float) -> float:
 # ── TP distribution table ─────────────────────────────────────────────────────
 
 _TP_DIST: dict = {
+    # Optimal back-weighted distributions confirmed from backtesting analysis.
+    # Key insight: later TPs (TP3-TP6) hit nearly as often as TP1 but give
+    # 3-5x more R per unit — so they deserve more weight, not less.
+    # TP1 still gets 14% minimum to trigger ratchet SL move.
     1:  [100],
     2:  [70, 30],
     3:  [50, 30, 20],
     4:  [40, 30, 20, 10],
-    5:  [35, 25, 20, 12, 8],
-    6:  [30, 25, 18, 12, 9, 6],
-    7:  [28, 22, 16, 12, 9, 7, 6],
-    8:  [25, 20, 15, 12, 10, 8, 6, 4],
-    9:  [23, 18, 14, 12, 10, 8, 6, 5, 4],
-    10: [20, 17, 14, 12, 10, 8, 6, 5, 4, 4],
-    11: [19, 16, 13, 11, 10, 8, 7, 6, 5, 3, 2],
-    12: [18, 15, 12, 11, 10, 8, 7, 6, 5, 4, 2, 2],
-    13: [17, 14, 12, 11,  9, 8, 7, 6, 5, 4, 3, 2, 2],
-    14: [16, 14, 11, 10,  9, 8, 7, 6, 5, 4, 3, 3, 2, 2],
-    15: [15, 13, 11, 10,  9, 8, 7, 6, 5, 4, 3, 3, 2, 2, 2],
+    5:  [40, 20, 15, 15, 10],         # 5T: front-heavy, these signals are weak
+    6:  [14, 10, 15, 19, 20, 22],     # 6T: back-weighted, TP4-6 carry most value
+    7:  [14, 10, 13, 17, 16, 15, 15], # 7T: most common bucket (31% of signals)
+    8:  [14,  8, 11, 13, 13, 14, 15, 12],
+    9:  [14,  8, 10, 11, 12, 12, 12, 11, 10],
+    10: [10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
+    11: [10, 10, 10, 10, 10, 10, 10, 10, 10,  5,  5],
+    12: [ 9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  5,  5],
+    13: [ 8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  6,  6],
+    14: [ 8,  8,  8,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  6],
+    15: [ 7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  6,  6,  4],
 }
 
 
@@ -151,6 +160,20 @@ class TradeManager:
         if await self._db.get_trade_by_symbol(sig.symbol):
             log.info("Active trade already exists for %s – skipping", sig.symbol)
             return
+
+        # ── Signal filter: RSI, BTC weekly, zone quality ──────────────────
+        decision, reason = evaluate_signal(
+            symbol      = sig.symbol,
+            entry_high  = sig.entry_high,
+            entry_low   = sig.entry_low,
+            stop_loss   = sig.stop_loss,
+            targets     = sig.targets,
+            direction   = sig.direction.value,
+        )
+        if decision == "SKIP":
+            log.info("Signal SKIPPED %s: %s", sig.symbol, reason)
+            return
+        log.info("Signal ACCEPTED %s: %s", sig.symbol, reason)
 
         leverage = min(sig.leverage_max, config.max_leverage)
         self._bybit.set_leverage(sig.symbol, leverage)

@@ -211,6 +211,106 @@ class BybitClient:
             self._fail(f"fetch_ticker {symbol}", exc)
         return None
 
+    def fetch_btc_weekly_trend(self) -> Optional[str]:
+        """
+        Returns the BTC weekly candle trend: "bull", "bear", or None (on error).
+
+        Logic:
+          - Fetch the last 2 weekly candles for BTCUSDT (interval="W")
+          - The most recent CLOSED weekly candle: if close < open → "bear"
+          - If close >= open → "bull"
+          - We use the second-to-last candle (the last fully closed week)
+            because the current week is still forming.
+
+        Data proven: LONG trades during BTC bear weeks = 20% WR.
+                     LONG trades during BTC bull weeks = 70%+ WR.
+        "Don't buy altcoins when Bitcoin is falling on the weekly" —
+        the oldest and most reliable rule in crypto trading.
+        """
+        try:
+            resp = self._session.get_kline(
+                category="linear", symbol="BTCUSDT",
+                interval="W", limit=3,
+            )
+            raw = resp.get("result", {}).get("list", [])
+            # raw[0] = current (forming) week, raw[1] = last closed week
+            if not raw or len(raw) < 2:
+                return None
+            # Last fully closed weekly candle
+            # Bybit kline format: [timestamp, open, high, low, close, volume, turnover]
+            closed = raw[1]
+            open_price  = float(closed[1])
+            close_price = float(closed[4])
+            trend = "bull" if close_price >= open_price else "bear"
+            self._ok()
+            log.debug(
+                "BTC weekly trend: open=%.0f close=%.0f → %s",
+                open_price, close_price, trend,
+            )
+            return trend
+        except Exception as exc:
+            self._fail("fetch_btc_weekly_trend", exc)
+            return None
+
+    def fetch_indicators(self, symbol: str, interval: str = "60",
+                         rsi_period: int = 14) -> Dict[str, Any]:
+        """
+        Fetch RSI and MACD at the current moment for a symbol.
+        interval: "60" = 1h candles (default), "240" = 4h, "D" = daily
+        Returns dict with keys: rsi, macd_hist, macd_hist_prev, macd_trend
+        All values None if insufficient data.
+        """
+        out: Dict[str, Any] = {
+            "rsi": None, "macd_hist": None,
+            "macd_hist_prev": None, "macd_trend": None,
+        }
+        try:
+            resp = self._session.get_kline(
+                category="linear", symbol=symbol,
+                interval=interval, limit=70,
+            )
+            raw = resp.get("result", {}).get("list", [])
+            if not raw or len(raw) < rsi_period + 2:
+                return out
+            closes = [float(c[4]) for c in reversed(raw)]
+
+            # ── RSI ──────────────────────────────────────────────────────────
+            rc = closes[-(rsi_period + 1):]
+            d  = [rc[i] - rc[i-1] for i in range(1, len(rc))]
+            g  = [max(x, 0) for x in d]
+            lo = [abs(min(x, 0)) for x in d]
+            ag = sum(g[:rsi_period]) / rsi_period
+            al = sum(lo[:rsi_period]) / rsi_period
+            for i in range(rsi_period, len(d)):
+                ag = (ag * (rsi_period - 1) + g[i]) / rsi_period
+                al = (al * (rsi_period - 1) + lo[i]) / rsi_period
+            out["rsi"] = round(100.0 if al == 0 else 100.0 - 100.0 / (1 + ag / al), 2)
+
+            # ── MACD ─────────────────────────────────────────────────────────
+            if len(closes) >= 35:
+                def _ema(v, p):
+                    if len(v) < p: return []
+                    k = 2.0 / (p + 1)
+                    r = [None] * (p - 1)
+                    r.append(sum(v[:p]) / p)
+                    for x in v[p:]:
+                        r.append(x * k + r[-1] * (1 - k))
+                    return r
+                ef = _ema(closes, 12)
+                es = _ema(closes, 26)
+                ml = [f - s for f, s in zip(ef, es)
+                      if f is not None and s is not None]
+                if len(ml) >= 9:
+                    se = _ema(ml, 9)
+                    if len(se) >= 2 and se[-1] is not None:
+                        out["macd_hist"]      = ml[-1] - se[-1]
+                        out["macd_hist_prev"] = ml[-2] - (se[-2] if se[-2] is not None else se[-1])
+                        out["macd_trend"]     = "bull" if ml[-1] > 0 else "bear"
+            self._ok()
+        except Exception as exc:
+            self._fail(f"fetch_indicators {symbol}", exc)
+        return out
+
     def fetch_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         try:
             resp = self._session.get_positions(category="linear", symbol=symbol)
