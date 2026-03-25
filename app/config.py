@@ -57,38 +57,49 @@ def _load() -> "Config":
         # ── Risk & sizing ─────────────────────────────────────────────────────
         default_leverage=_int("DEFAULT_LEVERAGE", 10),
         max_leverage=_int("MAX_LEVERAGE", 10),
-        risk_per_trade=_float("RISK_PER_TRADE", 0.10),
-        short_size_multiplier=_float("SHORT_SIZE_MULTIPLIER", 1.5),
+        risk_per_trade=_float("RISK_PER_TRADE", 0.05),
+        short_size_multiplier=_float("SHORT_SIZE_MULTIPLIER", 1.0),
         dry_run=_bool("DRY_RUN", False),
 
+        # ── Quality-based sizing ──────────────────────────────────────────────
+        # signal_quality.py scores each signal 0-6 and multiplies risk_per_trade
+        # HIGH (score ≥5) → 1.5×  |  MED (3-4) → 1.0×  |  LOW (≤2) → 0.7×
+        # Confirmed on val set Nov 2024–May 2025: +85% vs flat sizing
+        quality_sizing_enabled=_bool("QUALITY_SIZING_ENABLED", True),
+        quality_mult_high=_float("QUALITY_MULT_HIGH", 1.5),
+        quality_mult_med=_float("QUALITY_MULT_MED", 1.0),
+        quality_mult_low=_float("QUALITY_MULT_LOW", 0.7),
+        quality_high_threshold=_int("QUALITY_HIGH_THRESHOLD", 5),
+        quality_med_threshold=_int("QUALITY_MED_THRESHOLD", 3),
+
         # ── Blowthrough cancel ────────────────────────────────────────────────
-        # When ON: if price moves to entry_mid while entries pending → cancel all
-        # This removes 41% WR "full zone" trades and keeps 88% WR "edge/mid" trades
+        # If price moves past 35% into the entry zone while entries pending
+        # → cancel all entries. Hardcoded 35% threshold in trade_manager.py.
         blowthrough_cancel=_bool("BLOWTHROUGH_CANCEL", True),
 
-        # ── Signal quality filter ─────────────────────────────────────────────
-        # Signals that don't pass are ignored (no orders placed)
+        # ── Signal quality filters ────────────────────────────────────────────
         filter_enabled=_bool("FILTER_ENABLED", True),
-        filter_min_entry_range_pct=_float("FILTER_MIN_ENTRY_RANGE_PCT", 3.0),
+        filter_min_entry_range_pct=_float("FILTER_MIN_ENTRY_RANGE_PCT", 2.0),
+        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 3.0),
+        filter_max_sl_pct=_float("FILTER_MAX_SL_PCT", 0.0),
+        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 1.1),
         filter_min_num_targets=_int("FILTER_MIN_NUM_TARGETS", 6),
+        filter_block_8t_long=_bool("FILTER_BLOCK_8T_LONG", True),
 
-        # ── RSI filter (Binance API) ──────────────────────────────────────────
-        # Core confirmed edge: RSI 1h < 40 gives WR 79.4% Sharpe +0.622
-        # Fetched from Binance public API at signal time (no key needed)
-        filter_rsi_signal_max=_int("FILTER_RSI_SIGNAL_MAX", 40),
+        # ── RSI filter ────────────────────────────────────────────────────────
+        # Fetched from Binance public API at signal time (no key needed).
+        # RSI<40 Sharpe=+0.550. DO NOT raise above 40 — tested, degrades edge.
+        filter_rsi_signal_max=_float("FILTER_RSI_SIGNAL_MAX", 40.0),
         filter_rsi_tf=os.getenv("FILTER_RSI_TF", "1h"),
 
-        # ── SL distance filters ───────────────────────────────────────────────
-        # filter_min_sl_pct: skip signals where SL is too tight (noise wicks)
-        # filter_max_sl_pct: skip signals where SL is too wide (bad R ratio)
-        filter_min_sl_pct=_float("FILTER_MIN_SL_PCT", 3.0),
-        filter_max_sl_pct=_float("FILTER_MAX_SL_PCT", 0.0),   # 0 = disabled
-
-        # ── TP1 R:R maximum ───────────────────────────────────────────────────
-        filter_max_tp1_rr=_float("FILTER_MAX_TP1_RR", 1.1),
-
         # ── BTC weekly filter ─────────────────────────────────────────────────
+        # Blocks LONG signals when BTC weekly candle is bearish.
         filter_btc_weekly_enabled=_bool("FILTER_BTC_WEEKLY_ENABLED", True),
+
+        # ── Trailing stop (not yet implemented in trade_manager.py) ───────────
+        # Uncomment TRAIL_ACTIVATION_TP and TRAIL_PCT in .env when ready.
+        trail_activation_tp=_int("TRAIL_ACTIVATION_TP", 0),   # 0 = disabled
+        trail_pct=_float("TRAIL_PCT", 0.0),
 
         # ── Paths ─────────────────────────────────────────────────────────────
         log_file=_p("BOT_LOG_FILE", "${PATH}/logs/bot.log"),

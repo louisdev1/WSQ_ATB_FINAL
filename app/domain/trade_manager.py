@@ -1,16 +1,24 @@
 """
 trade_manager.py – Central domain layer.
 
-Entry ladder:  65% @ entry_high / 25% @ entry_mid / 10% @ entry_low  (LONG)
-               65% @ entry_low  / 25% @ entry_mid / 10% @ entry_high (SHORT)
+Entry:  Single limit order at zone edge (confirmed optimal from analysis)
+          LONG:  100% at entry_HIGH
+          SHORT: 100% at entry_LOW
+        No ladder — 35% blowthrough cancel makes entry_mid unreachable.
+        Blowthrough depth threshold: 35% into zone.
 
-Blowthrough cancel:
-  LONG:  if live price ≤ entry_mid while entries pending → cancel all entries
-  SHORT: if live price ≥ entry_mid while entries pending → cancel all entries
-  Rationale: price blowing through the zone = 41% WR vs 88% WR at edge/mid.
+TP ratchet:
+        TP1 → cancel remaining entries, SL → avg_entry (break-even)
+        TP2+ → SL → previous TP price
 
-TP ratchet:   TP1 → cancel entries, SL to avg entry
-              TP2+ → SL to previous TP price
+Quality sizing:
+        Each signal is scored 0-6 by signal_quality.py before placing orders.
+        HIGH (≥5) → 1.5×  |  MED (3-4) → 1.0×  |  LOW (≤2) → 0.7×
+        Confirmed on val set Nov 2024–May 2025: +85% vs flat sizing.
+
+Filters wired in:
+        evaluate_signal() from signal_filter.py is called before every trade.
+        RSI<40 (1h) + BTC weekly + structural filters all enforced here.
 """
 
 import logging
@@ -18,9 +26,10 @@ import math
 from typing import Optional, List, Tuple
 
 from app.config import config
+from app.domain.signal_filter import evaluate_signal
+from app.domain.signal_quality import compute_quality_score, quality_risk_multiplier
 from app.exchange.bybit_client import BybitClient
 from app.storage.database import Database
-from app.domain.signal_filter import evaluate_signal
 from app.parsing.models import (
     ParsedMessage, MessageType, Direction,
     NewSignal, CloseAll, CloseSymbol, CancelRemainingEntries,
@@ -30,34 +39,15 @@ from app.parsing.models import (
 
 log = logging.getLogger(__name__)
 
+# Blowthrough threshold: if price moves this far into the entry zone,
+# cancel all remaining entry orders. Confirmed 35% from backtest analysis.
+BLOWTHROUGH_DEPTH = 0.35
 
-# ── entry ladder ──────────────────────────────────────────────────────────────
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _is_long(direction: str) -> bool:
     return direction.lower() in ("long", "buy")
-
-
-def _calc_ladder(entry_low: float, entry_high: float, direction: str) -> List[Tuple]:
-    """
-    Single limit order — 100% of position at the zone edge.
-
-    Confirmed optimal from backtesting analysis (Jan 2024 – May 2025):
-      - 35% blowthrough cancel makes entry_mid unreachable on first touch
-      - entry_mid order never fills for kept trades
-      - 100% at zone edge gives identical R per trade, lower complexity
-
-    LONG:  100% at entry_high  (price must dip to here to fill)
-    SHORT: 100% at entry_low   (price must rise to here to fill)
-    Single-price signals: 100% at that price.
-    """
-    if entry_low <= 0 or entry_high <= entry_low:
-        price = entry_high if entry_high > 0 else entry_low
-        return [(price, 1.0)]
-
-    if _is_long(direction):
-        return [(entry_high, 1.0)]
-    else:
-        return [(entry_low, 1.0)]
 
 
 def _opposite_side(direction: str) -> str:
@@ -70,53 +60,82 @@ def _entry_side(direction: str) -> str:
 
 def _calc_qty(balance: float, risk_fraction: float, entry_price: float,
               stop_loss: float, leverage: int) -> float:
+    """
+    Position size based on risk amount and SL distance.
+    Capped at (balance × leverage) / entry_price to prevent over-leverage.
+    Floored to 3 decimal places.
+    """
     if entry_price <= 0 or stop_loss <= 0 or entry_price == stop_loss:
         return 0.0
     risk_amount = balance * risk_fraction
     distance    = abs(entry_price - stop_loss)
-    qty = risk_amount / distance
-    max_qty_by_balance = (balance * leverage) / entry_price
-    qty = min(qty, max_qty_by_balance)
-    return math.floor(qty * 1000) / 1000
+    qty         = risk_amount / distance
+    max_qty     = (balance * leverage) / entry_price
+    return math.floor(min(qty, max_qty) * 1000) / 1000
 
 
 def _floor3(v: float) -> float:
     return math.floor(v * 1000) / 1000
 
 
-# ── TP distribution table ─────────────────────────────────────────────────────
+def _effective_risk(signal: NewSignal) -> float:
+    """
+    Compute the effective risk fraction for this signal.
+    Applies quality multiplier if QUALITY_SIZING_ENABLED=true.
+    """
+    base_risk = config.risk_per_trade
+
+    if not getattr(config, "quality_sizing_enabled", True):
+        return base_risk
+
+    sig_dict = {
+        "entry_low":  signal.entry_low,
+        "entry_high": signal.entry_high,
+        "stop_loss":  signal.stop_loss,
+        "targets":    signal.targets,
+        "side":       signal.direction.value if signal.direction else "LONG",
+    }
+    score      = compute_quality_score(sig_dict)
+    multiplier = quality_risk_multiplier(score)
+    effective  = base_risk * multiplier
+
+    log.info(
+        "Quality score %d/6 → %.1f× multiplier → %.1f%% effective risk "
+        "(base=%.1f%%)",
+        score, multiplier, effective * 100, base_risk * 100,
+    )
+    return effective
+
+
+# ── TP distribution table (confirmed optimal from wsq_tp_optimizer.py) ───────
 
 _TP_DIST: dict = {
-    # Optimal back-weighted distributions confirmed from backtesting analysis.
-    # Key insight: later TPs (TP3-TP6) hit nearly as often as TP1 but give
-    # 3-5x more R per unit — so they deserve more weight, not less.
-    # TP1 still gets 14% minimum to trigger ratchet SL move.
-    1:  [100],
-    2:  [70, 30],
-    3:  [50, 30, 20],
-    4:  [40, 30, 20, 10],
-    5:  [40, 20, 15, 15, 10],         # 5T: front-heavy, these signals are weak
-    6:  [14, 10, 15, 19, 20, 22],     # 6T: back-weighted, TP4-6 carry most value
-    7:  [14, 10, 13, 17, 16, 15, 15], # 7T: most common bucket (31% of signals)
+    5:  [40, 20, 15, 15, 10],
+    6:  [14, 10, 15, 19, 20, 22],
+    7:  [14, 10, 13, 17, 16, 15, 15],
     8:  [14,  8, 11, 13, 13, 14, 15, 12],
     9:  [14,  8, 10, 11, 12, 12, 12, 11, 10],
     10: [10, 10, 10, 10, 10, 10, 10, 10, 10, 10],
-    11: [10, 10, 10, 10, 10, 10, 10, 10, 10,  5,  5],
-    12: [ 9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  5,  5],
-    13: [ 8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  6,  6],
-    14: [ 8,  8,  8,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  6],
-    15: [ 7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  6,  6,  4],
 }
 
 
 def _tp_fractions(n: int) -> list:
+    """
+    Return TP allocation fractions for n remaining targets.
+    Falls back to even split for unusual target counts.
+    """
     if n in _TP_DIST:
         pcts = _TP_DIST[n]
+    elif n <= 0:
+        return []
     else:
-        pcts = [100 / n] * n
+        pcts = [round(100 / n)] * n
+        pcts[-1] += 100 - sum(pcts)
     total = sum(pcts)
     return [p / total for p in pcts]
 
+
+# ── TradeManager ──────────────────────────────────────────────────────────────
 
 class TradeManager:
     def __init__(self, db: Database, bybit: BybitClient):
@@ -125,56 +144,48 @@ class TradeManager:
 
     async def handle(self, msg: ParsedMessage):
         t = msg.message_type
-        if t == MessageType.NEW_SIGNAL:
-            await self._handle_new_signal(msg)
-        elif t == MessageType.CLOSE_ALL:
-            await self._handle_close_all(msg)
-        elif t == MessageType.CLOSE_SYMBOL:
-            await self._handle_close_symbol(msg)
-        elif t == MessageType.CANCEL_REMAINING_ENTRIES:
-            await self._handle_cancel_entries(msg)
-        elif t == MessageType.MOVE_SL_BREAK_EVEN:
-            await self._handle_move_sl_be(msg)
-        elif t == MessageType.MOVE_SL_PRICE:
-            await self._handle_move_sl_price(msg)
-        elif t == MessageType.UPDATE_TARGETS:
-            await self._handle_update_targets(msg)
-        elif t == MessageType.MARKET_ENTRY:
-            await self._handle_market_entry(msg)
-        elif t == MessageType.PARTIAL_CLOSE:
-            await self._handle_partial_close(msg)
-        elif t == MessageType.CANCEL_SIGNAL:
-            await self._handle_cancel_signal(msg)
-        elif t == MessageType.ADD_ENTRIES:
-            await self._handle_add_entries(msg)
-        else:
-            log.debug("Ignored message type %s", t)
+        if   t == MessageType.NEW_SIGNAL:               await self._handle_new_signal(msg)
+        elif t == MessageType.CLOSE_ALL:                await self._handle_close_all(msg)
+        elif t == MessageType.CLOSE_SYMBOL:             await self._handle_close_symbol(msg)
+        elif t == MessageType.CANCEL_REMAINING_ENTRIES: await self._handle_cancel_entries(msg)
+        elif t == MessageType.MOVE_SL_BREAK_EVEN:       await self._handle_move_sl_be(msg)
+        elif t == MessageType.MOVE_SL_PRICE:            await self._handle_move_sl_price(msg)
+        elif t == MessageType.UPDATE_TARGETS:           await self._handle_update_targets(msg)
+        elif t == MessageType.MARKET_ENTRY:             await self._handle_market_entry(msg)
+        elif t == MessageType.PARTIAL_CLOSE:            await self._handle_partial_close(msg)
+        elif t == MessageType.CANCEL_SIGNAL:            await self._handle_cancel_signal(msg)
+        elif t == MessageType.ADD_ENTRIES:              await self._handle_add_entries(msg)
+        else:                                           log.debug("Ignored: %s", t)
 
-    # ── new signal ────────────────────────────────────────────────────────────
+    # ── New signal ────────────────────────────────────────────────────────────
 
     async def _handle_new_signal(self, sig: NewSignal):
         if not sig.symbol or not sig.direction:
             log.warning("NewSignal missing symbol or direction – skipped")
             return
 
+        # ── Step 1: Signal filter (RSI, BTC weekly, structural) ───────────────
+        decision, reason = evaluate_signal(
+            symbol     = sig.symbol,
+            direction  = sig.direction.value,
+            entry_high = sig.entry_high,
+            entry_low  = sig.entry_low,
+            stop_loss  = sig.stop_loss,
+            targets    = sig.targets,
+        )
+        if decision != "TAKE":
+            log.info("Signal REJECTED %s: %s", sig.symbol, reason)
+            return
+
+        # ── Step 2: Duplicate check ───────────────────────────────────────────
         if await self._db.get_trade_by_symbol(sig.symbol):
             log.info("Active trade already exists for %s – skipping", sig.symbol)
             return
 
-        # ── Signal filter: RSI, BTC weekly, zone quality ──────────────────
-        decision, reason = evaluate_signal(
-            symbol      = sig.symbol,
-            entry_high  = sig.entry_high,
-            entry_low   = sig.entry_low,
-            stop_loss   = sig.stop_loss,
-            targets     = sig.targets,
-            direction   = sig.direction.value,
-        )
-        if decision == "SKIP":
-            log.info("Signal SKIPPED %s: %s", sig.symbol, reason)
-            return
-        log.info("Signal ACCEPTED %s: %s", sig.symbol, reason)
+        # ── Step 3: Quality score → effective risk ────────────────────────────
+        effective_risk = _effective_risk(sig)
 
+        # ── Step 4: Set leverage and fetch balance ────────────────────────────
         leverage = min(sig.leverage_max, config.max_leverage)
         self._bybit.set_leverage(sig.symbol, leverage)
 
@@ -183,13 +194,17 @@ class TradeManager:
             log.error("Cannot determine balance – skipping %s", sig.symbol)
             return
 
-        entry_ref = sig.entry_high if sig.entry_high > 0 else sig.entry_low
-        qty = _calc_qty(balance, config.risk_per_trade, entry_ref, sig.stop_loss, leverage)
+        # ── Step 5: Single limit order at zone edge ───────────────────────────
+        # LONG:  100% at entry_HIGH (price drops to zone top)
+        # SHORT: 100% at entry_LOW  (price rallies down into zone)
+        fill_price = sig.entry_high if _is_long(sig.direction.value) else sig.entry_low
+        qty        = _calc_qty(balance, effective_risk, fill_price, sig.stop_loss, leverage)
 
         if qty <= 0:
             log.warning("Calculated qty=0 for %s – skipping", sig.symbol)
             return
 
+        # ── Step 6: Save to DB ────────────────────────────────────────────────
         trade_id = await self._db.upsert_trade({
             "signal_telegram_id": sig.telegram_message_id,
             "symbol":    sig.symbol,
@@ -202,31 +217,27 @@ class TradeManager:
             "state":      "pending",
         })
 
-        side   = _entry_side(sig.direction.value)
-        # Direction-aware ladder: LONG=65% at entry_high, SHORT=65% at entry_low
-        ladder = _calc_ladder(sig.entry_low, sig.entry_high, sig.direction.value)
-
-        for price, fraction in ladder:
-            price     = round(price, 8)
-            order_qty = _floor3(qty * fraction)
-            if order_qty <= 0 or price <= 0:
-                continue
-            order_id = self._bybit.place_limit_order(
-                sig.symbol, side, order_qty, price, order_type_label="entry"
+        # ── Step 7: Place single limit entry order ────────────────────────────
+        side     = _entry_side(sig.direction.value)
+        order_id = self._bybit.place_limit_order(
+            sig.symbol, side, qty, round(fill_price, 8),
+            order_type_label="entry",
+        )
+        if order_id:
+            await self._db.save_order(
+                trade_id, order_id, sig.symbol,
+                "entry", side, fill_price, qty,
             )
-            if order_id:
-                await self._db.save_order(
-                    trade_id, order_id, sig.symbol, "entry", side, price, order_qty
-                )
 
         self._bybit.move_stop_loss(sig.symbol, sig.stop_loss)
-
         await self._db.update_trade_state(trade_id, "active")
+
         log.info(
-            "Trade opened: %s %s | qty=%.4f | ladder=%s | sl=%.5f",
-            sig.symbol, sig.direction.value, qty,
-            " / ".join(f"{p:.5f}({f*100:.0f}%)" for p, f in ladder),
-            sig.stop_loss,
+            "Trade opened: %s %s | qty=%.4f | entry=%.6g | sl=%.6g | "
+            "risk=%.1f%% (quality-adjusted) | filter=%s",
+            sig.symbol, sig.direction.value,
+            qty, fill_price, sig.stop_loss,
+            effective_risk * 100, reason,
         )
 
     # ── TP order management ───────────────────────────────────────────────────
@@ -241,6 +252,7 @@ class TradeManager:
         if not targets or filled_qty <= 0:
             return
 
+        # Cancel any existing open TP orders
         open_orders = await self._db.get_open_orders_for_trade(trade_id)
         for order in open_orders:
             if order["order_type"].startswith("tp"):
@@ -254,23 +266,23 @@ class TradeManager:
             log.info("All TP levels already hit for %s", symbol)
             return
 
-        fracs      = _tp_fractions(len(remaining_targets))
+        fracs = _tp_fractions(len(remaining_targets))
         for i, tp_price in enumerate(remaining_targets):
             tp_num    = highest_tp_hit + i + 1
             qty_for_tp = _floor3(filled_qty * fracs[i])
             if tp_price <= 0 or qty_for_tp <= 0:
                 continue
             order_id = self._bybit.place_take_profit_order(
-                symbol, close_side, qty_for_tp, tp_price
+                symbol, close_side, qty_for_tp, tp_price,
             )
             if order_id:
                 await self._db.save_order(
-                    trade_id, order_id, symbol, f"tp{tp_num}",
-                    close_side, tp_price, qty_for_tp
+                    trade_id, order_id, symbol,
+                    f"tp{tp_num}", close_side, tp_price, qty_for_tp,
                 )
 
         log.info(
-            "TP orders refreshed for %s | filled=%.4f | remaining=%d",
+            "TP orders placed for %s | filled=%.4f | %d remaining targets",
             symbol, filled_qty, len(remaining_targets),
         )
 
@@ -287,7 +299,8 @@ class TradeManager:
         await self._db.update_trade(trade["id"], highest_tp_hit=tp_num)
 
         if tp_num == 1:
-            log.info("Ratchet TP1 %s → cancel entries, SL→entry %.5f", symbol, avg_entry)
+            # TP1: cancel any unfilled entries, move SL to break-even
+            log.info("Ratchet TP1 %s → cancel entries, SL → entry %.6g", symbol, avg_entry)
             await self._handle_cancel_entries(
                 CancelRemainingEntries(
                     raw_text="", message_type=MessageType.CANCEL_REMAINING_ENTRIES,
@@ -299,74 +312,81 @@ class TradeManager:
                 if ok:
                     await self._db.update_trade(trade["id"], stop_loss=avg_entry)
         else:
+            # TP2+: ratchet SL to previous TP price
             prev_tp_price = targets[tp_num - 2] if len(targets) >= tp_num - 1 else None
             if prev_tp_price and prev_tp_price > 0:
                 ok = self._bybit.move_stop_loss(symbol, prev_tp_price)
                 if ok:
                     await self._db.update_trade(trade["id"], stop_loss=prev_tp_price)
-                    log.info("Ratchet TP%d %s → SL→TP%d %.5f",
-                             tp_num, symbol, tp_num - 1, prev_tp_price)
+                    log.info(
+                        "Ratchet TP%d %s → SL → TP%d %.6g",
+                        tp_num, symbol, tp_num - 1, prev_tp_price,
+                    )
 
-    # ── blowthrough cancel ────────────────────────────────────────────────────
+    # ── Blowthrough cancel ────────────────────────────────────────────────────
 
     async def check_blowthrough(self):
         """
         Called every 30s from the watchdog.
 
-        If price has moved to or through entry_mid while entry orders are still
-        pending (not yet filled), cancel all remaining entry orders.
+        Cancels remaining entry orders if price blows through 35% of the
+        entry zone from the edge. This removes low-probability full-fill
+        scenarios and keeps only trades where price barely touched the zone.
 
-        LONG:  blowthrough = live price ≤ entry_mid
-               (price dropped from above entry_high all the way to mid = bearish momentum)
-        SHORT: blowthrough = live price ≥ entry_mid
-               (price rallied from below entry_low all the way to mid = bullish momentum)
-
-        This removes trades where all 3 ladder levels would fill (41% WR)
-        and keeps only trades where price barely touched the zone then bounced
-        (88-90% WR).
+        LONG:  blowthrough price = entry_high - 35% × zone_width
+        SHORT: blowthrough price = entry_low  + 35% × zone_width
         """
+        if not getattr(config, "blowthrough_cancel", True):
+            return
+
         trades = await self._db.get_active_trades()
         for trade in trades:
             symbol    = trade["symbol"]
             direction = trade["direction"]
-            entry_mid = (trade.get("entry_low", 0) + trade.get("entry_high", 0)) / 2
 
-            # Only check trades that still have unfilled entry orders
             if trade.get("entries_cancelled"):
                 continue
             if trade.get("filled_size", 0) and trade["filled_size"] > 0:
-                # Already filled — blowthrough cancel doesn't apply
                 continue
 
             open_orders = await self._db.get_open_orders_for_trade(trade["id"])
-            pending_entries = [o for o in open_orders if o["order_type"] == "entry"]
-            if not pending_entries:
+            if not any(o["order_type"] == "entry" for o in open_orders):
                 continue
 
-            # Fetch live price
-            ticker = self._bybit.fetch_ticker(symbol)
+            e_high = trade.get("entry_high", 0)
+            e_low  = trade.get("entry_low",  0)
+            if e_high <= 0 or e_low <= 0:
+                continue
+
+            zone_width        = e_high - e_low
+            blowthrough_price = (
+                e_high - BLOWTHROUGH_DEPTH * zone_width if _is_long(direction)
+                else e_low + BLOWTHROUGH_DEPTH * zone_width
+            )
+
+            ticker     = self._bybit.fetch_ticker(symbol)
             if not ticker:
                 continue
             live_price = ticker
 
-            blowthrough = False
-            if _is_long(direction) and live_price <= entry_mid:
-                blowthrough = True
-            elif not _is_long(direction) and live_price >= entry_mid:
-                blowthrough = True
+            blowthrough = (
+                (_is_long(direction)  and live_price <= blowthrough_price) or
+                (not _is_long(direction) and live_price >= blowthrough_price)
+            )
 
             if blowthrough:
                 log.info(
-                    "BLOWTHROUGH CANCEL %s %s: live=%.6g mid=%.6g → cancelling entries",
-                    symbol, direction, live_price, entry_mid,
+                    "BLOWTHROUGH CANCEL %s %s: live=%.6g threshold=%.6g → cancelling",
+                    symbol, direction, live_price, blowthrough_price,
                 )
-                for order in pending_entries:
-                    ok = self._bybit.cancel_order(symbol, order["bybit_order_id"])
-                    if ok:
-                        await self._db.mark_order_status(order["bybit_order_id"], "cancelled")
+                for order in open_orders:
+                    if order["order_type"] == "entry":
+                        ok = self._bybit.cancel_order(symbol, order["bybit_order_id"])
+                        if ok:
+                            await self._db.mark_order_status(order["bybit_order_id"], "cancelled")
                 await self._db.update_trade(trade["id"], entries_cancelled=1)
                 await self._db.update_trade_state(trade["id"], "cancelled")
-                log.info("Blowthrough cancel complete for %s — trade cancelled", symbol)
+                log.info("Blowthrough cancel complete for %s", symbol)
 
     # ── WebSocket execution handler ───────────────────────────────────────────
 
@@ -394,15 +414,15 @@ class TradeManager:
                 continue
 
             order_type = order.get("order_type", "")
-            log.info("WS execution: %s %s qty=%.4f price=%.5f",
+            log.info("WS execution: %s %s qty=%.4f price=%.6g",
                      symbol, order_type, exec_qty, avg_price)
 
             await self._db.mark_order_status(order_id, "filled")
 
             if order_type == "entry":
-                pos       = self._bybit.fetch_position(symbol)
-                filled    = float(pos.get("size", 0))    if pos else exec_qty
-                pos_avg   = float(pos.get("avgPrice", 0)) if pos else avg_price
+                pos         = self._bybit.fetch_position(symbol)
+                filled      = float(pos.get("size", 0))     if pos else exec_qty
+                pos_avg     = float(pos.get("avgPrice", 0)) if pos else avg_price
                 prev_filled = trade.get("filled_size", 0) or 0.0
 
                 await self._db.update_trade(
@@ -413,7 +433,7 @@ class TradeManager:
                     sl_price = trade.get("stop_loss", 0)
                     if sl_price and sl_price > 0:
                         ok = self._bybit.move_stop_loss(symbol, sl_price)
-                        log.info("SL enforced on first fill %s → %.5f (ok=%s)",
+                        log.info("SL enforced on first fill %s → %.6g (ok=%s)",
                                  symbol, sl_price, ok)
 
                 fresh_trade = await self._db.get_trade_by_symbol(symbol)
@@ -455,26 +475,21 @@ class TradeManager:
                         await self._db.update_trade_state(trade["id"], "sl_hit")
                         log.warning("SL hit for %s – trade marked sl_hit", trade["symbol"])
 
-    # ── startup sync ──────────────────────────────────────────────────────────
+    # ── Startup sync ──────────────────────────────────────────────────────────
 
     async def startup_position_sync(self):
-        """
-        Called once at bot startup.
-        Checks all active DB trades against live Bybit positions and
-        reconciles any that filled while the bot was offline.
-        """
         trades = await self._db.get_active_trades()
         if not trades:
             log.info("Startup sync: no active trades in DB")
             return
 
-        log.info("Startup sync: checking %d active trade(s) against Bybit…", len(trades))
+        log.info("Startup sync: checking %d active trade(s)…", len(trades))
         for trade in trades:
             symbol      = trade["symbol"]
             prev_filled = trade.get("filled_size", 0) or 0.0
 
             pos       = self._bybit.fetch_position(symbol)
-            filled    = float(pos.get("size", 0))    if pos else 0.0
+            filled    = float(pos.get("size", 0))     if pos else 0.0
             avg_price = float(pos.get("avgPrice", 0)) if pos else 0.0
 
             if filled <= 0 and prev_filled > 0:
@@ -483,10 +498,8 @@ class TradeManager:
                 continue
 
             if filled > 0 and abs(filled - prev_filled) > 0.0001:
-                log.info(
-                    "Startup sync: %s fill updated %.4f → %.4f (avg=%.5f)",
-                    symbol, prev_filled, filled, avg_price,
-                )
+                log.info("Startup sync: %s fill %.4f → %.4f (avg=%.6g)",
+                         symbol, prev_filled, filled, avg_price)
                 await self._db.update_trade(
                     trade["id"], filled_size=filled, avg_entry_price=avg_price,
                 )
@@ -500,7 +513,7 @@ class TradeManager:
             else:
                 log.info("Startup sync: %s OK (filled=%.4f)", symbol, filled)
 
-    # ── fill-size sync (watchdog fallback) ────────────────────────────────────
+    # ── Fill sync (watchdog fallback) ─────────────────────────────────────────
 
     async def sync_fills(self):
         trades = await self._db.get_active_trades()
@@ -509,7 +522,7 @@ class TradeManager:
             prev_filled = trade.get("filled_size", 0) or 0.0
 
             pos       = self._bybit.fetch_position(symbol)
-            filled    = float(pos.get("size", 0))    if pos else 0.0
+            filled    = float(pos.get("size", 0))     if pos else 0.0
             avg_price = float(pos.get("avgPrice", 0)) if pos else 0.0
 
             if filled <= 0 and prev_filled > 0:
@@ -533,10 +546,10 @@ class TradeManager:
                 if fresh_trade:
                     await self._refresh_tp_orders(fresh_trade, filled)
 
-    # ── close all ─────────────────────────────────────────────────────────────
+    # ── Close all ─────────────────────────────────────────────────────────────
 
     async def _handle_close_all(self, _msg: CloseAll):
-        log.warning("CLOSE ALL triggered from Telegram")
+        log.warning("CLOSE ALL triggered")
         trades = await self._db.get_active_trades()
         for trade in trades:
             sym = trade["symbol"]
@@ -549,12 +562,11 @@ class TradeManager:
             await self._db.update_trade_state(trade["id"], "closed")
         log.info("Close-all complete: %d trades closed", len(trades))
 
-    # ── close symbol ──────────────────────────────────────────────────────────
+    # ── Close symbol ──────────────────────────────────────────────────────────
 
     async def _handle_close_symbol(self, msg: CloseSymbol):
         trade = await self._db.get_trade_by_symbol(msg.symbol)
         if not trade:
-            log.info("No active trade for %s – close_symbol ignored", msg.symbol)
             return
         self._bybit.cancel_orders_for_symbol(msg.symbol)
         pos = self._bybit.fetch_position(msg.symbol)
@@ -565,12 +577,11 @@ class TradeManager:
         await self._db.update_trade_state(trade["id"], "closed")
         log.info("Closed trade for %s", msg.symbol)
 
-    # ── cancel remaining entries ──────────────────────────────────────────────
+    # ── Cancel remaining entries ──────────────────────────────────────────────
 
     async def _handle_cancel_entries(self, msg: CancelRemainingEntries):
         trade = await self._db.get_trade_by_symbol(msg.symbol)
         if not trade:
-            log.info("No active trade for %s – cancel_entries ignored", msg.symbol)
             return
         open_orders = await self._db.get_open_orders_for_trade(trade["id"])
         for order in open_orders:
@@ -579,32 +590,25 @@ class TradeManager:
                 if ok:
                     await self._db.mark_order_status(order["bybit_order_id"], "cancelled")
         await self._db.update_trade(trade["id"], entries_cancelled=1)
-        log.info("Cancelled remaining entry orders for %s", msg.symbol)
 
-    # ── move SL to break-even ─────────────────────────────────────────────────
+    # ── Move SL to break-even ─────────────────────────────────────────────────
 
     async def _handle_move_sl_be(self, msg: MoveSLBreakEven):
         symbol = msg.symbol or None
-        trades = (
-            [await self._db.get_trade_by_symbol(symbol)]
-            if symbol
-            else await self._db.get_active_trades()
-        )
+        trades = ([await self._db.get_trade_by_symbol(symbol)] if symbol
+                  else await self._db.get_active_trades())
         for trade in trades:
             if not trade:
                 continue
-            pos = self._bybit.fetch_position(trade["symbol"])
-            if not pos:
-                continue
-            avg_entry = float(pos.get("avgPrice", 0) or trade.get("avg_entry_price", 0))
+            pos       = self._bybit.fetch_position(trade["symbol"])
+            avg_entry = float(pos.get("avgPrice", 0) if pos else
+                              trade.get("avg_entry_price", 0))
             if avg_entry <= 0:
                 avg_entry = (trade["entry_low"] + trade["entry_high"]) / 2
-
             ok = self._bybit.move_stop_loss(trade["symbol"], avg_entry)
             if ok:
-                await self._db.update_trade(
-                    trade["id"], break_even_activated=1, stop_loss=avg_entry
-                )
+                await self._db.update_trade(trade["id"],
+                                            break_even_activated=1, stop_loss=avg_entry)
                 await self._handle_cancel_entries(
                     CancelRemainingEntries(
                         raw_text="", message_type=MessageType.CANCEL_REMAINING_ENTRIES,
@@ -612,34 +616,26 @@ class TradeManager:
                     )
                 )
                 await self._db.update_trade_state(trade["id"], "break_even")
-                log.info("SL moved to break-even %.5f for %s", avg_entry, trade["symbol"])
+                log.info("SL → break-even %.6g for %s", avg_entry, trade["symbol"])
 
-    # ── move SL to price ──────────────────────────────────────────────────────
+    # ── Move SL to price ──────────────────────────────────────────────────────
 
     async def _handle_move_sl_price(self, msg: MoveSLPrice):
         symbol = msg.symbol or None
-        trades = (
-            [await self._db.get_trade_by_symbol(symbol)]
-            if symbol
-            else await self._db.get_active_trades()
-        )
+        trades = ([await self._db.get_trade_by_symbol(symbol)] if symbol
+                  else await self._db.get_active_trades())
         for trade in trades:
             if not trade:
                 continue
             ok = self._bybit.move_stop_loss(trade["symbol"], msg.price)
             if ok:
                 await self._db.update_trade(trade["id"], stop_loss=msg.price)
-                log.info("SL updated to %.5f for %s", msg.price, trade["symbol"])
 
-    # ── update targets ────────────────────────────────────────────────────────
+    # ── Update targets ────────────────────────────────────────────────────────
 
     async def _handle_update_targets(self, msg: UpdateTargets):
         trade = await self._db.get_trade_by_symbol(msg.symbol)
-        if not trade:
-            log.info("No active trade for %s – update_targets ignored", msg.symbol)
-            return
-        if not msg.targets:
-            log.info("No targets parsed for %s – ignored", msg.symbol)
+        if not trade or not msg.targets:
             return
 
         open_orders = await self._db.get_open_orders_for_trade(trade["id"])
@@ -651,80 +647,69 @@ class TradeManager:
         pos       = self._bybit.fetch_position(msg.symbol)
         total_qty = float(pos.get("size", 0)) if pos else trade.get("filled_size", 0)
         if total_qty <= 0:
-            log.warning("Cannot place TP orders – unknown qty for %s", msg.symbol)
             return
 
         await self._db.update_trade(trade["id"], targets=msg.targets, highest_tp_hit=0)
-        updated_trade = await self._db.get_trade_by_symbol(msg.symbol)
-        await self._refresh_tp_orders(updated_trade, total_qty)
-        log.info("Targets updated for %s: %s", msg.symbol, msg.targets)
+        updated = await self._db.get_trade_by_symbol(msg.symbol)
+        await self._refresh_tp_orders(updated, total_qty)
 
-    # ── add entries ───────────────────────────────────────────────────────────
+    # ── Add entries ───────────────────────────────────────────────────────────
 
     async def _handle_add_entries(self, msg: AddEntries):
         trade = await self._db.get_trade_by_symbol(msg.symbol)
         if not trade:
-            log.info("No active trade for %s – add_entries ignored", msg.symbol)
             return
-        balance   = self._bybit.fetch_wallet_balance()
-        leverage  = trade.get("leverage", config.default_leverage)
+        balance  = self._bybit.fetch_wallet_balance()
+        leverage = trade.get("leverage", config.default_leverage)
         entry_mid = (msg.entry_low + msg.entry_high) / 2
-        qty = _calc_qty(balance, config.risk_per_trade / 2, entry_mid,
-                        trade["stop_loss"], leverage)
+        qty = _calc_qty(balance, config.risk_per_trade / 2,
+                        entry_mid, trade["stop_loss"], leverage)
         if qty <= 0:
             return
         side   = _entry_side(trade["direction"])
-        prices = [msg.entry_low, msg.entry_high] if msg.entry_low != msg.entry_high else [msg.entry_low]
-        half_qty = _floor3(qty / len(prices))
+        prices = ([msg.entry_low, msg.entry_high]
+                  if msg.entry_low != msg.entry_high else [msg.entry_low])
+        half   = _floor3(qty / len(prices))
         for price in prices:
-            order_id = self._bybit.place_limit_order(msg.symbol, side, half_qty, price,
-                                                     order_type_label="add_entry")
+            order_id = self._bybit.place_limit_order(
+                msg.symbol, side, half, price, order_type_label="add_entry")
             if order_id:
                 await self._db.save_order(trade["id"], order_id, msg.symbol,
-                                          "entry", side, price, half_qty)
-        log.info("Added entries for %s at %.5f-%.5f", msg.symbol, msg.entry_low, msg.entry_high)
+                                          "entry", side, price, half)
 
-    # ── market entry ──────────────────────────────────────────────────────────
+    # ── Market entry ──────────────────────────────────────────────────────────
 
     async def _handle_market_entry(self, msg: MarketEntry):
         trade = await self._db.get_trade_by_symbol(msg.symbol) if msg.symbol else None
         if not trade:
-            log.info("market_entry: no active trade for %s – ignored", msg.symbol)
             return
-        balance   = self._bybit.fetch_wallet_balance()
-        leverage  = trade.get("leverage", config.default_leverage)
-        pos       = self._bybit.fetch_position(msg.symbol)
-        current_size = float(pos.get("size", 0)) if pos else 0.0
-        entry_mid = (trade["entry_low"] + trade["entry_high"]) / 2
-        qty = _calc_qty(balance, config.risk_per_trade, entry_mid, trade["stop_loss"], leverage)
-        remaining_qty = max(0, qty - current_size)
-        if remaining_qty <= 0:
-            log.info("market_entry: position already full for %s", msg.symbol)
+        balance  = self._bybit.fetch_wallet_balance()
+        leverage = trade.get("leverage", config.default_leverage)
+        pos      = self._bybit.fetch_position(msg.symbol)
+        current  = float(pos.get("size", 0)) if pos else 0.0
+        mid      = (trade["entry_low"] + trade["entry_high"]) / 2
+        qty      = _calc_qty(balance, config.risk_per_trade, mid, trade["stop_loss"], leverage)
+        remaining = max(0, qty - current)
+        if remaining <= 0:
             return
         direction = msg.direction.value if msg.direction else trade["direction"]
-        side = _entry_side(direction)
+        side      = _entry_side(direction)
         await self._handle_cancel_entries(
-            CancelRemainingEntries(
-                raw_text="", message_type=MessageType.CANCEL_REMAINING_ENTRIES,
-                symbol=msg.symbol,
-            )
-        )
-        order_id = self._bybit.place_market_order(msg.symbol, side, remaining_qty)
+            CancelRemainingEntries(raw_text="",
+                                   message_type=MessageType.CANCEL_REMAINING_ENTRIES,
+                                   symbol=msg.symbol))
+        order_id = self._bybit.place_market_order(msg.symbol, side, remaining)
         if order_id:
             await self._db.save_order(trade["id"], order_id, msg.symbol,
-                                      "entry", side, 0, remaining_qty)
-        log.info("Market entry executed for %s", msg.symbol)
+                                      "entry", side, 0, remaining)
 
-    # ── partial close ─────────────────────────────────────────────────────────
+    # ── Partial close ─────────────────────────────────────────────────────────
 
     async def _handle_partial_close(self, msg: PartialClose):
-        symbol = msg.symbol if msg.symbol else None
-        if symbol:
-            trade = await self._db.get_trade_by_symbol(symbol)
+        if msg.symbol:
+            trade = await self._db.get_trade_by_symbol(msg.symbol)
             if trade:
                 await self._partial_close_trade(trade, msg.percent)
-            else:
-                log.info("partial_close: no active trade for %s", symbol)
         else:
             for t in await self._db.get_active_trades():
                 await self._partial_close_trade(t, msg.percent)
@@ -734,27 +719,26 @@ class TradeManager:
         pos    = self._bybit.fetch_position(symbol)
         if not pos:
             return
-        total_size = float(pos.get("size", 0))
-        close_qty  = _floor3(total_size * (percent / 100))
+        total    = float(pos.get("size", 0))
+        close_qty = _floor3(total * (percent / 100))
         if close_qty <= 0:
             return
         close_side = "Sell" if pos.get("side", "Buy") == "Buy" else "Buy"
-        order_id   = self._bybit.place_market_order(symbol, close_side, close_qty, reduce_only=True)
+        order_id   = self._bybit.place_market_order(symbol, close_side,
+                                                    close_qty, reduce_only=True)
         if order_id:
             await self._db.save_order(trade["id"], order_id, symbol,
                                       "close", close_side, 0, close_qty)
-        log.info("Partial close %.0f%% for %s qty=%.4f", percent, symbol, close_qty)
 
-    # ── cancel signal ─────────────────────────────────────────────────────────
+    # ── Cancel signal ─────────────────────────────────────────────────────────
 
     async def _handle_cancel_signal(self, msg: CancelSignal):
         trade = await self._db.get_trade_by_symbol(msg.symbol) if msg.symbol else None
         if not trade:
-            log.info("cancel_signal: no active trade for %s", msg.symbol)
             return
         pos = self._bybit.fetch_position(msg.symbol)
         if pos is not None and float(pos.get("size", 0)) > 0:
-            log.info("cancel_signal: %s already has a live position – not cancelling", msg.symbol)
+            log.info("cancel_signal: %s has live position – not cancelling", msg.symbol)
             return
         self._bybit.cancel_orders_for_symbol(msg.symbol)
         await self._db.update_trade_state(trade["id"], "cancelled")
