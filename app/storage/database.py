@@ -92,6 +92,31 @@ class Database:
             "ALTER TABLE trades ADD COLUMN size_mult REAL DEFAULT 1.0",
             "ALTER TABLE trades ADD COLUMN rsi_at_signal REAL",
             "ALTER TABLE trades ADD COLUMN mid_rsi_risk INTEGER DEFAULT 0",
+            # ── v2 migrations: PnL tracking, close timestamp, quality metadata ──
+            "ALTER TABLE trades ADD COLUMN closed_at TEXT",
+            "ALTER TABLE trades ADD COLUMN realised_pnl REAL",
+            "ALTER TABLE trades ADD COLUMN quality_score INTEGER",
+            "ALTER TABLE trades ADD COLUMN quality_multiplier REAL",
+            "ALTER TABLE trades ADD COLUMN filter_reason TEXT",
+            "ALTER TABLE trades ADD COLUMN rsi_at_entry REAL",
+            "ALTER TABLE trades ADD COLUMN btc_weekly_at_entry TEXT",
+        ]
+        # ── v2 migration: rejected signals table ─────────────────────────────
+        table_migrations = [
+            """CREATE TABLE IF NOT EXISTS rejected_signals (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol          TEXT NOT NULL,
+                direction       TEXT,
+                reason          TEXT,
+                entry_low       REAL,
+                entry_high      REAL,
+                stop_loss       REAL,
+                n_targets       INTEGER,
+                rsi_value       REAL,
+                btc_weekly      TEXT,
+                quality_score   INTEGER,
+                rejected_at     TEXT DEFAULT (datetime('now'))
+            )""",
         ]
         for sql in migrations:
             try:
@@ -101,6 +126,12 @@ class Database:
                 log.info("DB migration: added column %s", col)
             except Exception:
                 pass  # Column already exists — fine
+        for sql in table_migrations:
+            try:
+                await self._db.execute(sql)
+                await self._db.commit()
+            except Exception:
+                pass
 
     async def close(self):
         if self._db:
@@ -262,3 +293,78 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return row["sent_at"] if row else None
+
+    # ── closed trades (for status-update) ────────────────────────────────────
+
+    async def get_closed_trades_since(self, since_iso: str) -> List[Dict]:
+        """Return trades closed or SL-hit since the given ISO timestamp."""
+        async with self._db.execute(
+            """SELECT * FROM trades
+               WHERE state IN ('closed', 'sl_hit')
+                 AND COALESCE(closed_at, updated_at) >= ?
+               ORDER BY COALESCE(closed_at, updated_at) DESC""",
+            (since_iso,),
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["targets"] = json.loads(d.get("targets_json") or "[]")
+            result.append(d)
+        return result
+
+    async def close_trade_with_pnl(self, trade_id: int, state: str,
+                                    realised_pnl: Optional[float] = None):
+        """Mark a trade as closed/sl_hit and record PnL + timestamp."""
+        kwargs: Dict[str, Any] = {
+            "state": state,
+            "closed_at": "datetime('now')",
+        }
+        if realised_pnl is not None:
+            kwargs["realised_pnl"] = realised_pnl
+
+        # Build SET clause — special handling for datetime('now')
+        parts = []
+        vals  = []
+        for k, v in kwargs.items():
+            if v == "datetime('now')":
+                parts.append(f"{k}=datetime('now')")
+            else:
+                parts.append(f"{k}=?")
+                vals.append(v)
+        vals.append(trade_id)
+        sql = f"UPDATE trades SET {', '.join(parts)}, updated_at=datetime('now') WHERE id=?"
+        await self._db.execute(sql, vals)
+        await self._db.commit()
+
+    # ── rejected signals ─────────────────────────────────────────────────────
+
+    async def save_rejected_signal(self, data: Dict[str, Any]):
+        """Log a signal that was filtered out."""
+        await self._db.execute(
+            """INSERT INTO rejected_signals
+               (symbol, direction, reason, entry_low, entry_high,
+                stop_loss, n_targets, rsi_value, btc_weekly, quality_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                data.get("symbol"),
+                data.get("direction"),
+                data.get("reason"),
+                data.get("entry_low"),
+                data.get("entry_high"),
+                data.get("stop_loss"),
+                data.get("n_targets"),
+                data.get("rsi_value"),
+                data.get("btc_weekly"),
+                data.get("quality_score"),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_recent_rejected(self, limit: int = 10) -> List[Dict]:
+        """Return the most recent rejected signals."""
+        async with self._db.execute(
+            "SELECT * FROM rejected_signals ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]

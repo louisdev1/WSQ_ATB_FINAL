@@ -26,10 +26,11 @@ import math
 from typing import Optional, List, Tuple
 
 from app.config import config
-from app.domain.signal_filter import evaluate_signal
-from app.domain.signal_quality import compute_quality_score, quality_risk_multiplier
+from app.domain.signal_filter import evaluate_signal, _fetch_rsi, _binance_symbol, _fetch_btc_weekly_direction
+from app.domain.signal_quality import compute_quality_score, quality_risk_multiplier, quality_tier, describe_score
 from app.exchange.bybit_client import BybitClient
 from app.storage.database import Database
+from app.monitoring.alerter import send_notification
 from app.parsing.models import (
     ParsedMessage, MessageType, Direction,
     NewSignal, CloseAll, CloseSymbol, CancelRemainingEntries,
@@ -164,6 +165,21 @@ class TradeManager:
             log.warning("NewSignal missing symbol or direction – skipped")
             return
 
+        # ── Fetch RSI and BTC weekly early (used for filter, notification, DB) ─
+        b_sym   = _binance_symbol(sig.symbol)
+        rsi_val = _fetch_rsi(b_sym, getattr(config, "filter_rsi_tf", "1h"))
+        btc_dir = _fetch_btc_weekly_direction()
+
+        # ── Compute quality score early (used for notification even on reject) ──
+        sig_dict = {
+            "entry_low":  sig.entry_low,
+            "entry_high": sig.entry_high,
+            "stop_loss":  sig.stop_loss,
+            "targets":    sig.targets,
+            "side":       sig.direction.value if sig.direction else "LONG",
+        }
+        q_score = compute_quality_score(sig_dict)
+
         # ── Step 1: Signal filter (RSI, BTC weekly, structural) ───────────────
         decision, reason = evaluate_signal(
             symbol     = sig.symbol,
@@ -175,6 +191,24 @@ class TradeManager:
         )
         if decision != "TAKE":
             log.info("Signal REJECTED %s: %s", sig.symbol, reason)
+            # ── Log rejection to DB for the `rejected` command ────────────────
+            await self._db.save_rejected_signal({
+                "symbol":        sig.symbol,
+                "direction":     sig.direction.value if sig.direction else None,
+                "reason":        reason,
+                "entry_low":     sig.entry_low,
+                "entry_high":    sig.entry_high,
+                "stop_loss":     sig.stop_loss,
+                "n_targets":     len(sig.targets),
+                "rsi_value":     rsi_val,
+                "btc_weekly":    btc_dir,
+                "quality_score": q_score,
+            })
+            await send_notification(
+                f"🚫 *Signal rejected:* `{sig.symbol}` {sig.direction.value.upper()}\n"
+                f"Reason: _{reason}_\n"
+                f"Quality: {q_score}/6 | RSI: {rsi_val or 'n/a'} | BTC wk: {btc_dir or 'n/a'}"
+            )
             return
 
         # ── Step 2: Duplicate check ───────────────────────────────────────────
@@ -184,6 +218,8 @@ class TradeManager:
 
         # ── Step 3: Quality score → effective risk ────────────────────────────
         effective_risk = _effective_risk(sig)
+        q_mult = quality_risk_multiplier(q_score)
+        q_tier = quality_tier(q_score)
 
         # ── Step 4: Set leverage and fetch balance ────────────────────────────
         leverage = min(sig.leverage_max, config.max_leverage)
@@ -204,7 +240,7 @@ class TradeManager:
             log.warning("Calculated qty=0 for %s – skipping", sig.symbol)
             return
 
-        # ── Step 6: Save to DB ────────────────────────────────────────────────
+        # ── Step 6: Save to DB with quality metadata ──────────────────────────
         trade_id = await self._db.upsert_trade({
             "signal_telegram_id": sig.telegram_message_id,
             "symbol":    sig.symbol,
@@ -216,6 +252,18 @@ class TradeManager:
             "targets":    sig.targets,
             "state":      "pending",
         })
+        # Store quality + filter metadata on the trade row
+        await self._db.update_trade(
+            trade_id,
+            quality_score=q_score,
+            quality_multiplier=q_mult,
+            tier=q_tier,
+            size_mult=q_mult,
+            filter_reason=reason,
+            rsi_at_entry=rsi_val,
+            btc_weekly_at_entry=btc_dir,
+            rsi_at_signal=rsi_val,
+        )
 
         # ── Step 7: Place single limit entry order ────────────────────────────
         side     = _entry_side(sig.direction.value)
@@ -238,6 +286,25 @@ class TradeManager:
             sig.symbol, sig.direction.value,
             qty, fill_price, sig.stop_loss,
             effective_risk * 100, reason,
+        )
+
+        # ── Step 8: Send trade-open notification with sizing breakdown ────────
+        desc = describe_score(sig_dict)
+        notional = qty * fill_price
+        await send_notification(
+            f"📈 *Trade opened:* `{sig.symbol}` {sig.direction.value.upper()}\n\n"
+            f"*Sizing breakdown:*\n"
+            f"  Quality: `{q_score}/6` [{q_tier}] → `{q_mult:.1f}×` multiplier\n"
+            f"  Base risk: `{config.risk_per_trade*100:.1f}%` → Effective: `{effective_risk*100:.1f}%`\n"
+            f"  Qty: `{qty:.4f}` @ `{fill_price:.6g}` (≈`{notional:.1f}` USDT notional)\n"
+            f"  Leverage: `{leverage}×` | Balance: `{balance:.2f}` USDT\n\n"
+            f"*Filters passed:*\n"
+            f"  RSI ({getattr(config, 'filter_rsi_tf', '1h')}): `{rsi_val:.1f}` {'✅' if rsi_val and rsi_val < getattr(config, 'filter_rsi_signal_max', 40) else '⚠️'}\n"
+            f"  BTC weekly: `{btc_dir or 'n/a'}` {'✅' if btc_dir != 'bear' else '❌'}\n\n"
+            f"*Signal geometry:*\n"
+            f"```\n{desc}\n```\n\n"
+            f"Entry: `{sig.entry_low:.6g}`–`{sig.entry_high:.6g}` | "
+            f"SL: `{sig.stop_loss:.6g}` | TPs: {len(sig.targets)}"
         )
 
     # ── TP order management ───────────────────────────────────────────────────
@@ -451,8 +518,10 @@ class TradeManager:
                 pos       = self._bybit.fetch_position(symbol)
                 remaining = float(pos.get("size", 0)) if pos else 0.0
                 if remaining <= 0:
-                    await self._db.update_trade_state(trade["id"], "closed")
-                    log.info("All TPs filled for %s – trade closed", symbol)
+                    # All TPs filled — estimate realised PnL from cumulative PnL field
+                    cum_pnl = float(pos.get("cumRealisedPnl", 0)) if pos else None
+                    await self._db.close_trade_with_pnl(trade["id"], "closed", cum_pnl)
+                    log.info("All TPs filled for %s – trade closed (pnl=%.4f)", symbol, cum_pnl or 0)
                 else:
                     fresh_trade = await self._db.get_trade_by_symbol(symbol)
                     if fresh_trade:
@@ -472,8 +541,12 @@ class TradeManager:
                 if order:
                     trade = await self._db.get_trade_by_id(order["trade_id"])
                     if trade:
-                        await self._db.update_trade_state(trade["id"], "sl_hit")
-                        log.warning("SL hit for %s – trade marked sl_hit", trade["symbol"])
+                        # Estimate PnL: SL was hit, so loss ≈ risk amount
+                        # Try to get from position cumRealisedPnl if still available
+                        pos = self._bybit.fetch_position(trade["symbol"])
+                        pnl = float(pos.get("cumRealisedPnl", 0)) if pos else None
+                        await self._db.close_trade_with_pnl(trade["id"], "sl_hit", pnl)
+                        log.warning("SL hit for %s – trade marked sl_hit (pnl=%.4f)", trade["symbol"], pnl or 0)
 
     # ── Startup sync ──────────────────────────────────────────────────────────
 
@@ -494,7 +567,7 @@ class TradeManager:
 
             if filled <= 0 and prev_filled > 0:
                 log.info("Startup sync: %s position gone – marking closed", symbol)
-                await self._db.update_trade_state(trade["id"], "closed")
+                await self._db.close_trade_with_pnl(trade["id"], "closed")
                 continue
 
             if filled > 0 and abs(filled - prev_filled) > 0.0001:
@@ -526,7 +599,7 @@ class TradeManager:
             avg_price = float(pos.get("avgPrice", 0)) if pos else 0.0
 
             if filled <= 0 and prev_filled > 0:
-                await self._db.update_trade_state(trade["id"], "closed")
+                await self._db.close_trade_with_pnl(trade["id"], "closed")
                 log.info("Sync: trade %s closed externally", symbol)
                 continue
 
@@ -555,11 +628,12 @@ class TradeManager:
             sym = trade["symbol"]
             self._bybit.cancel_orders_for_symbol(sym)
             pos = self._bybit.fetch_position(sym)
+            pnl = float(pos.get("unrealisedPnl", 0)) if pos else None
             if pos:
                 size       = float(pos.get("size", 0))
                 close_side = "Sell" if pos.get("side", "Buy") == "Buy" else "Buy"
                 self._bybit.close_position(sym, size, close_side)
-            await self._db.update_trade_state(trade["id"], "closed")
+            await self._db.close_trade_with_pnl(trade["id"], "closed", pnl)
         log.info("Close-all complete: %d trades closed", len(trades))
 
     # ── Close symbol ──────────────────────────────────────────────────────────
@@ -570,12 +644,13 @@ class TradeManager:
             return
         self._bybit.cancel_orders_for_symbol(msg.symbol)
         pos = self._bybit.fetch_position(msg.symbol)
+        pnl = float(pos.get("unrealisedPnl", 0)) if pos else None
         if pos:
             size       = float(pos.get("size", 0))
             close_side = "Sell" if pos.get("side", "Buy") == "Buy" else "Buy"
             self._bybit.close_position(msg.symbol, size, close_side)
-        await self._db.update_trade_state(trade["id"], "closed")
-        log.info("Closed trade for %s", msg.symbol)
+        await self._db.close_trade_with_pnl(trade["id"], "closed", pnl)
+        log.info("Closed trade for %s (pnl=%.4f)", msg.symbol, pnl or 0)
 
     # ── Cancel remaining entries ──────────────────────────────────────────────
 
